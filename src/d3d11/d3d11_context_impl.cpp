@@ -41,6 +41,12 @@
 #include "util_flags.hpp"
 #include "util_math.hpp"
 #include "util_win32_compat.h"
+#include "../dxmt/gs_probe.hpp"
+#include <fstream>
+#include <chrono>
+#include <mutex>
+#include <unordered_map>
+#include <ctime>
 
 namespace dxmt {
 
@@ -1567,6 +1573,50 @@ public:
     };
   }
 
+  // sonde : par paire VS+GS, draws, indices, instances, threadgroups object, sur des fenêtres de 10 s
+  void
+  GSProbe(UINT Count, UINT InstanceCount, const GeometryDrawLayout &layout, int kind) {
+    struct Stat {
+      uint64_t draws = 0, verts = 0, inst = 0, object_tg = 0, maxv = 0, topo = 0, kind = 0;
+      ManagedShader vs = nullptr, gs = nullptr;
+    };
+    static std::mutex mtx;
+    static std::unordered_map<uint64_t, Stat> stats;
+    static auto last = std::chrono::steady_clock::now();
+    static uint64_t last_frames = 0, last_draws = 0;
+    auto vs = GetManagedShader<PipelineStage::Vertex>(), gs = GetManagedShader<PipelineStage::Geometry>();
+    std::lock_guard<std::mutex> l(mtx);
+    auto &st = stats[(uint64_t)(uintptr_t)vs * 31 + (uint64_t)(uintptr_t)gs];
+    st.vs = vs;
+    st.gs = gs;
+    st.draws++;
+    st.verts += uint64_t(Count) * InstanceCount;
+    st.inst += InstanceCount;
+    st.object_tg += uint64_t((Count - 1) / layout.vertex_increment_per_warp + 1) *
+                    ((InstanceCount - 1) / SM50GSInstancesPerWarp(Count, layout.vertex_per_warp, layout.pack_unit) + 1);
+    st.maxv = std::max<uint64_t>(st.maxv, Count);
+    st.topo = state_.InputAssembler.Topology;
+    st.kind = kind;
+    auto now = std::chrono::steady_clock::now();
+    if (now - last > std::chrono::seconds(10)) {
+      double dt = std::chrono::duration<double>(now - last).count();
+      uint64_t frames = gs_probe_frames.load(), draws = gs_probe_draws.load();
+      double nf = std::max<double>(frames - last_frames, 1);
+      std::ofstream f(GS_PROBE_DIR + "stats.txt", std::ios::app);
+      f << "=== T=" << time(nullptr) << " dt=" << dt << " frames=" << (frames - last_frames) << " fps=" << nf / dt
+        << " draws/frame=" << (draws - last_draws) / nf << "\n";
+      for (auto &[k, v] : stats)
+        f << v.vs->sha1().string().substr(0, 12) << " " << v.gs->sha1().string().substr(0, 12)
+          << " draws/f=" << v.draws / nf << " idx/f=" << v.verts / nf << " inst/draw=" << double(v.inst) / v.draws
+          << " objTG/f=" << v.object_tg / nf << " maxcount=" << v.maxv << " topo=" << v.topo << " kind=" << v.kind
+          << "\n";
+      stats.clear();
+      last = now;
+      last_frames = frames;
+      last_draws = draws;
+    }
+  }
+
   void
   GeometryDraw(
       UINT VertexCountPerInstance, UINT InstanceCount, UINT StartVertexLocation,
@@ -1575,6 +1625,7 @@ public:
     auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_ARGUMENTS), 32);
     auto max_object_threadgroups = max_object_threadgroups_;
     auto layout = GetGeometryDrawLayout();
+    GSProbe(VertexCountPerInstance, InstanceCount, layout, 0);
     EmitOP([=](ArgumentEncodingContext &enc) {
       DXMT_DRAW_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(draw_arguments_offset);
       draw_argument->StartVertex = StartVertexLocation;
@@ -1615,6 +1666,7 @@ public:
     auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_INDEXED_ARGUMENTS), 32);
     auto max_object_threadgroups = max_object_threadgroups_;
     auto layout = GetGeometryDrawLayout();
+    GSProbe(IndexCountPerInstance, InstanceCount, layout, 1);
     EmitOP([=](ArgumentEncodingContext &enc) {
       DXMT_DRAW_INDEXED_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(draw_arguments_offset);
       draw_argument->BaseVertex = BaseVertexLocation;
@@ -1731,6 +1783,7 @@ public:
   ) {
     auto max_object_threadgroups = max_object_threadgroups_;
     auto layout = GetGeometryDrawLayout();
+    GSProbe(1, 1, layout, 2);
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
       EmitOP([=, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
@@ -1765,6 +1818,7 @@ public:
     auto IndexBufferOffset = state_.InputAssembler.IndexBufferOffset;
     auto max_object_threadgroups = max_object_threadgroups_;
     auto layout = GetGeometryDrawLayout();
+    GSProbe(1, 1, layout, 3);
 
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
       EmitOP([=, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
@@ -4902,6 +4956,7 @@ public:
   template <bool IndexedDraw>
   DrawCallStatus
   PreDraw() {
+    gs_probe_draws.fetch_add(1, std::memory_order_relaxed);
     DrawCallStatus status;
     if constexpr (IndexedDraw) {
       if (!state_.InputAssembler.IndexBuffer)

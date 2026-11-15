@@ -17,6 +17,9 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
+#include "gs_probe.hpp"
+#include <fstream>
+#include <ctime>
 #include "dxmt_command_queue.hpp"
 #include "Metal.hpp"
 #include "dxmt_statistics.hpp"
@@ -199,6 +202,11 @@ CommandQueue::WaitForFinishThread() {
     }
     if (chunk.attached_cmdbuf.status() == WMTCommandBufferStatusError) {
       ERR("Device error at frame ", chunk.frame_, ": ", chunk.attached_cmdbuf.error().description().getUTF8String());
+      {
+        std::ofstream f(GS_PROBE_DIR + "errors.txt", std::ios::app);
+        f << time(nullptr) << " frame " << chunk.frame_ << " "
+          << chunk.attached_cmdbuf.error().description().getUTF8String() << "\n";
+      }
     }
     if (auto logs = chunk.attached_cmdbuf.logs()) {
       for (auto &log : logs.elements()) {

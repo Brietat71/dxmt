@@ -1,3 +1,4 @@
+#include "../dxmt/gs_probe.hpp"
 #include "d3d11_swapchain.hpp"
 #include "com/com_guid.hpp"
 #include "config/config.hpp"
@@ -738,6 +739,7 @@ public:
   STDMETHODCALLTYPE
   Present1(UINT SyncInterval, UINT PresentFlags,
            const DXGI_PRESENT_PARAMETERS *pPresentParameters) final {
+    gs_probe_frames++;
     if (SyncInterval > 4)
       return DXGI_ERROR_INVALID_CALL;
 

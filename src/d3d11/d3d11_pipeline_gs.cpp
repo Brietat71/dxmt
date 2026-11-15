@@ -21,6 +21,9 @@
 #include "d3d11_device.hpp"
 #include "d3d11_pipeline.hpp"
 #include "log/log.hpp"
+#include <fstream>
+#include "d3d11_shader.hpp"
+#include "../dxmt/gs_probe.hpp"
 
 namespace dxmt {
 
@@ -49,6 +52,15 @@ public:
       unorm_output_reg_mask |= (uint32_t(IsUnorm8RenderTargetFormat(
                                     pDesc->ColorAttachmentFormats[i]))
                                 << i);
+    }
+    pDesc->VertexShader->dump();
+    pDesc->GeometryShader->dump();
+    {
+      std::ofstream f(GS_PROBE_DIR + "pairs.txt", std::ios::app);
+      f << pDesc->VertexShader->sha1().string() << " " << pDesc->GeometryShader->sha1().string() << " strip="
+        << (int)pDesc->GSStripTopology << " ib=" << (int)pDesc->IndexBufferFormat << " ps="
+        << (pDesc->PixelShader ? pDesc->PixelShader->sha1().string() : std::string("none")) << " rtv=" << num_rtvs
+        << " ds=" << (int)depth_stencil_format << " payload=" << PayloadSize << "\n";
     }
     VertexShader =
         pDesc->VertexShader->get_shader(ShaderVariantGeometryVertex{
