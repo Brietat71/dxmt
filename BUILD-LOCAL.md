@@ -112,3 +112,26 @@ Jeu de fichiers identique à `WARNO.app/Contents/SharedSupport/renderer/dxmt/win
 - Subsystem PE : `Windows GUI` ici, `Windows CUI` en référence (aucun flag dans le repo ; défaut lld). Sans effet pour une DLL.
 - `winemetal.so` : `minos 27.2` ici (défaut toolchain), `14.0` en référence.
   Si besoin d'un payload portable : `export MACOSX_DEPLOYMENT_TARGET=14.0` puis `meson compile -C build64 --clean && meson compile -C build64`.
+
+## Build arm64ec / arm64x (branche `arm64ec`, Wine arm64 natif + FEX, sans Rosetta)
+
+Cible : runtime Wine 11.19 arm64 natif de neutron (fourlexboehm/neutron `0ac2574`), construit par
+`~/code/arm64-wine/src/neutron/build.sh ~/code/arm64-wine/build` (toolchain propre : llvm-mingw 20260908
+patché « TEB en slot TSD », LLVM 15.0.7 **arm64** sans assertions, SDK Wine 11.19). Journal : `~/code/arm64-wine/PROGRESS.md`.
+
+Commits propres à la branche (patchs neutron importés) : `no-thread-local` (TLS compilateur = x18, que macOS efface :
+obligatoire), `neutron-fps-log` (`NEUTRON_FPS_LOG=1`), `cache-in-compatdata` (`DXMT_SHADER_CACHE_PATH` couvre aussi
+le cache Metal), `dynamic-no-write-combine` (le write-combined bloque FEX au retour en ARM64EC).
+
+```sh
+B=~/code/arm64-wine/build; T=$B/toolchains
+export PATH="$T/llvm-mingw-20260908-ucrt-macos-universal/bin:$PATH" MACOSX_DEPLOYMENT_TARGET=15.0
+meson setup --cross-file build-arm64ec.txt -Dnative_llvm_path=$T/llvm-darwin-arm64 -Dwine_install_path=$B/wine-sdk \
+  -Denable_d3d12=true -Denable_nvapi=true -Denable_nvngx=true build-arm64ec --buildtype release \
+  --prefix $(pwd)/install-arm64ec --strip
+meson compile -C build-arm64ec && meson install -C build-arm64ec     # 26 s
+```
+
+Résultat : `install-arm64ec/aarch64-windows/{d3d11,dxgi,d3d10core,d3d12,winemetal,nvapi64,nvngx}.dll` =
+**IMAGE_FILE_MACHINE_ARM64X** (CHPE ARM64EC), `install-arm64ec/aarch64-unix/winemetal.so` = Mach-O arm64 (minos 15.0).
+Installation : supprimer puis copier (jamais `cp` par-dessus un Mach-O chargé) dans `files/lib/wine/aarch64-{windows,unix}/`.
