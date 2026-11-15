@@ -201,6 +201,64 @@ Non fait :
   `session.sh` laisse maintenant 120 s.
 - **Combat** (`run_combat.sh`) : non mesuré en Élevé. Référence en Bas : ~70 fps en 4v4.
 
+## Mission 2 : minimum fps en vue dense, réglages au maximum (en cours)
+
+Cible : minimum ≥ 60 fps en Élevé sur le parcours caméra (`campath.sh`), profil `set_video.sh max`
+(3456×2234, Résolution 3D Off, Anisotropie 8X, Post-traitement Extrême). Rendu identique.
+La bouteille Rosetta est bloquée par une boîte Steam « Conflit avec le cloud » (choix réservé à l'utilisateur) :
+les mesures en jeu passent par la pile arm64.
+
+### Demandes de mesure (agent arm64)
+
+Runtime à construire depuis **`origin/gs-probe2`** (= `perf-gs` + 2 commits d'instrumentation, à ne pas fusionner).
+Il écrit dans `~/code/dxmt-gs-data/probe2/` (chemins codés en dur, rien à configurer) :
+`stats.txt` (toutes les 10 s : `T=<epoch>`, fps, draws/frame, et par paire VS+GS draws, indices, instances, threadgroups object),
+`pairs.txt` + `<sha1>.cso` (pipelines GS créés), `errors.txt` (erreurs de command buffer et numéro de frame),
+`errors-encoders.txt` (encodeurs du tampon fautif : `etat=4` = fautif, avec son étiquette).
+Les encodeurs de rendu sont étiquetés pour la trace Metal : `GS`/`TS`/`R`, nombre de couleurs, profondeur, taille (ex. `GS 0c1d 2048x2048x4`).
+
+1. **Vue dense fixe, profil max, Shaders Élevé.** Hesse → Lancer partie → x4 60 s → x1 → début du parcours
+   (zoom avant 6 crans, défilement droite 7 s, haut 7 s), puis **caméra arrêtée ≥ 40 s**. Dans cette vue :
+   fps, GPU ms, état GPU, CPU du thread principal ; **Metal System Trace 3 s** et l'export de la table
+   `metal-gpu-intervals` (chemin du `.xml`) ; noter l'heure (`date +%s`) d'entrée et de sortie de la vue.
+2. **Même vue en Shaders Bas** (basculé en jeu, sans bouger la caméra) : fps, GPU ms, CPU du thread principal, trace.
+3. **Parcours caméra** (2 boucles) dans le profil max : minimum, p5, médiane, moyenne.
+4. **GPU hang** : après un chargement en Élevé, le contenu de `errors.txt` et `errors-encoders.txt`.
+   Contre-épreuve : le même chargement en Élevé avec le runtime `fork` (ancien chemin GS) produit-il aussi
+   `Device error ... Caused GPU Hang Error` ? (attribution : mon chemin regroupé, ou les passes GS/TS en général).
+
+### Piste « routage par cascade en pipeline vertex » : évaluée, écartée
+
+Idée : le GS de WARNO ne fait que router le triangle vers la couche de chaque cascade touchée ; le rendre sans object ni mesh shader,
+par un draw instancié × cascades dont l'étage vertex sort la couche (`render_target_array_index`).
+
+- **Le test de boîte se remplace bien par le découpage** : un triangle dont la boîte ne recoupe pas la cascade est hors du volume, éliminé.
+- **Pas la troncature `maxvertexcount`.** Le GS déclare 9 sommets pour 4 cascades : un triangle qui touche les cascades 0, 1 et 2
+  n'est pas émis dans la 3. Reproduire cela exige la boîte du triangle, donc ses trois sommets, dans l'étage vertex :
+  la cascade 3 doit passer en draw non indexé où chaque sommet recalcule les trois VS de son triangle.
+- **Mesure** (`tools/gs-bench/bench.swift`, modes 4 et 5, cible 64×64 pour ne garder que la géométrie, minimum de 20 frames) :
+
+| Charge | Mesh regroupé actuel (mode 3, warp 60) | Vertex, toutes cascades, inexact (mode 4) | Vertex, exact avec troncature (mode 5) |
+|---|---|---|---|
+| A : 1 450 draws × 498 triangles indexés | 0,70 ms | 0,55 ms | 0,57-0,59 ms |
+| B : 203 draws × 5 759 billboards | 1,19 ms | 2,30-2,33 ms | 2,65 ms |
+
+- Au mieux 20 % de mieux sur les triangles indexés, **deux fois pire sur les billboards** (chaque quad part dans les 4 cascades).
+- Lecture : le chemin mesh regroupé est déjà au niveau d'un pipeline vertex natif. Ce qui reste dans les passes d'ombre est le travail
+  lui-même (VS et remplissage), pas le surcoût d'émulation. **Je n'implémente pas cette piste** : gain faible et de signe variable,
+  pour un second chemin de rendu à prouver et à maintenir.
+- Correction d'une mesure antérieure : dans le banc synthétique, la charge A lançait 30 threads par object threadgroup quel que soit le warp.
+  Le « × 2 à 60 sommets » annoncé pour A venait de là. Les gains des warps de 64 retenus sont ceux du banc aux vrais shaders (section 8), au bit près.
+
+### GPU hang (2 erreurs sur arm64, Élevé, aux frames 375 et 1179) : pas reproduit hors jeu
+
+- Les deux erreurs tombent à la **première frame d'une scène** (menu 3D, puis carte), d'après `~/Library/Logs/neutron/neutron-1611600.log`.
+- Banc aux vrais shaders, données adverses (`ADV=`), ancien et nouveau chemin : cascades nulles, cascades à INT_MAX, instances NaN,
+  instances nulles → aucune erreur GPU, sorties identiques (vides). Quads géants (`insthuge`) → **9,3 s de GPU par frame sans erreur**, sorties identiques.
+- Charge géométrie extrême : 8 000 draws × 5 759 instances → 71 ms (nouveau), **1,34 s (ancien)**, sans erreur.
+- Donc ni la durée d'un tampon ni des données dégénérées ne suffisent à produire un hang ici. Rien dans le chemin regroupé n'écrit hors de ses bornes
+  (relecture + sorties au bit près), sauf si le pipeline lié n'est pas celui du draw. Attribution impossible sans le jeu : voir la demande 4.
+
 ## 10. Reste à faire
 
 - [ ] Mesurer Élevé en combat 4v4 (`run_combat.sh`), où le CPU compte davantage.

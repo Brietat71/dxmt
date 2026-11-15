@@ -52,6 +52,10 @@ let cb = buf([Float]([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 1, 0, 0, -1000, 0, 1, 
 var casc = [Int32]()
 for h in [Int32(1000), 500, 250] { casc += [-h, -h, 7095, h, h, 100 - 1290, 0, 0] }
 casc += [300, 300, 7095, 900, 900, 100 - 1290, 0, 0]   // la 4e cascade ne s'emboîte pas : couche 3 couverte sans dépasser maxvertexcount
+// données adverses (ADV=) : cascades nulles (tampon pas encore rempli), instances NaN / nulles / énormes
+let adv = ProcessInfo.processInfo.environment["ADV"] ?? ""
+if adv.contains("casc0") { casc = [Int32](repeating: 0, count: 32) }
+if adv.contains("cascmax") { casc = [Int32](repeating: Int32.max, count: 32) }
 let bCasc = buf(casc)
 let tbd = MTLTextureDescriptor.textureBufferDescriptor(with: .r32Sint, width: casc.count, resourceOptions: .storageModeShared, usage: .shaderRead)
 let tCasc = bCasc.makeTexture(descriptor: tbd, offset: 0, bytesPerRow: casc.count * 4)!
@@ -96,6 +100,9 @@ if scen == "A" || strip {
   let big: Float = scen == "B" ? 1 : 3
   var id = [Float]()
   for _ in 0..<total { id += [rnd() * 2000, rnd() * 2000, rnd() * 50, (0.5 + rnd() * 1.5) * big, 0.125, 0, rnd(), rnd()] }
+  if adv.contains("instnan") { id = id.map { _ in Float.nan } }
+  if adv.contains("inst0") { id = id.map { _ in 0 } }
+  if adv.contains("insthuge") { id = id.enumerated().map { $0.offset % 8 == 3 ? 1e6 : $0.element } }   // quads géants
   let bi = buf(id); ib = buf(idx)
   vbTable = buf([VBEntry(addr: quad.gpuAddress, stride: 8, length: 32), VBEntry(addr: bi.gpuAddress, stride: 32, length: UInt32(bi.length))])
   // table de liaison du VS : s0, cube_s0, meta_s0 (biais lod), t0, meta_t0

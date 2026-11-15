@@ -190,3 +190,70 @@ static inline bool cascade(const device int *casc, uint i, Tri t, thread float3 
 #else
 [[fragment]] void frag(VOut in [[stage_in]]) {}
 #endif
+
+// ---- Expérience « routage par cascade en pipeline vertex » (sans object ni mesh shader) ----
+// vroute  : draw indexé, instancié x cascades. Le sommet sort dans la couche de sa cascade ; les triangles hors de la
+//           cascade sont éliminés par le découpage. Pas de test de boîte, pas de troncature maxvertexcount (inexact à 4 cascades).
+// vroute3 : cascade 3 seule, draw non indexé. Chaque sommet recalcule les 3 sommets de son triangle pour appliquer
+//           la troncature : rejeté s'il touche les cascades 0, 1 et 2 (les 9 sommets du GS sont alors épuisés).
+struct VOutL { float4 pos [[position]]; uint layer [[render_target_array_index]];
+#if NREG == 2
+  float2 uv;
+#endif
+};
+static inline float3 vs_world(const device packed_float3 *vb, const device float4 *inst, constant Uni &u, uint vid, uint iid) {
+  float4 it = inst[iid];
+  float4 wp = float4(float3(vb[vid]) * it.w + it.xyz, 1.0);
+  float4 p = float4(dot(u.row[0], wp), dot(u.row[1], wp), dot(u.row[2], wp), 1.0);
+  return float3(dot(u.row[3], p), dot(u.row[4], p), dot(u.row[5], p));
+}
+static inline float4 to_cascade(const device int *casc, uint i, float3 p) {
+  float2 rlo = float2(casc[8 * i + 0], casc[8 * i + 1]), rhi = float2(casc[8 * i + 3], casc[8 * i + 4]);
+  float zlo = float(casc[8 * i + 2]) - 7095.0, zhi = float(casc[8 * i + 5]) + 1290.0;
+  float3 scale = float3(2.0, -2.0, 1.0) / (float3(rhi, zhi) - float3(rlo, zlo));
+  return float4(p * scale - scale * float3((rlo + rhi) * 0.5, zlo), 1.0);
+}
+[[vertex]] VOutL vroute(uint vid [[vertex_id]], uint iid [[instance_id]],
+                        const device packed_float3 *vb [[buffer(1)]], constant DrawArgs &da [[buffer(2)]],
+                        const device float4 *inst [[buffer(3)]], constant Uni &u [[buffer(4)]],
+                        const device int *casc [[buffer(5)]]) {
+  uint c = iid % NCASC;
+  VOutL o;
+  o.pos = to_cascade(casc, c, vs_world(vb, inst, u, vid, da.startInstance + iid / NCASC));
+  o.layer = c;
+#if NREG == 2
+  o.uv = float3(vb[vid]).xy;
+#endif
+  return o;
+}
+[[vertex]] VOutL vroute3(uint vid [[vertex_id]], uint iid [[instance_id]], const device ushort *ib [[buffer(0)]],
+                         const device packed_float3 *vb [[buffer(1)]], constant DrawArgs &da [[buffer(2)]],
+                         const device float4 *inst [[buffer(3)]], constant Uni &u [[buffer(4)]],
+                         const device int *casc [[buffer(5)]]) {
+  uint tri = vid / 3, corner = vid % 3;
+  float3 p[3];
+  uint own = 0;
+  for (uint k = 0; k < 3; k++) {
+    uint v = uint(int(ib[da.startIndex + 3 * tri + k]) + da.baseVertex);
+    p[k] = vs_world(vb, inst, u, v, da.startInstance + iid);
+    if (k == corner) own = v;
+  }
+  float2 lo = min(p[0].xy, min(p[1].xy, p[2].xy)), hi = max(p[0].xy, max(p[1].xy, p[2].xy));
+  uint hits = 0;
+  for (uint i = 0; i < 3; i++) {
+    float2 rlo = float2(casc[8 * i + 0], casc[8 * i + 1]), rhi = float2(casc[8 * i + 3], casc[8 * i + 4]);
+    hits += uint(all(rhi >= lo) && all(hi >= rlo));
+  }
+  VOutL o;
+  o.pos = hits == 3 ? float4(0, 0, 2, 1) : to_cascade(casc, 3, p[corner]);   // tronqué : hors du volume, éliminé
+  o.layer = 3;
+#if NREG == 2
+  o.uv = float3(vb[own]).xy;
+#endif
+  return o;
+}
+#if NREG == 2
+[[fragment]] void fragL(VOutL in [[stage_in]]) { if (fract(in.uv.x * 7.0) < 0.05) discard_fragment(); }
+#else
+[[fragment]] void fragL(VOutL in [[stage_in]]) {}
+#endif

@@ -1,5 +1,7 @@
 // Banc synthétique : coût GPU d'une frame de draws « GS émulé » (mesh pipeline), par variante de mapping.
-// usage: bench <workload A|B|AB> <mode 0..3> <payloadWords> <pack 0|1> [frames]
+// usage: bench <workload A|B|AB> <mode 0..5> <payloadWords> <pack 0|1> [frames] [sommets par warp]
+// modes 4 et 5 : routage par cascade en pipeline vertex (4 = toutes cascades instanciées, inexact ; 5 = cascades 0-2
+// instanciées + cascade 3 non indexée avec la troncature, exact)
 import Metal
 import Foundation
 
@@ -7,17 +9,29 @@ let a = CommandLine.arguments
 let workload = a[1], mode = Int(a[2])!, payloadWords = Int(a[3])!, pack = Int(a[4])!
 let frames = a.count > 5 ? Int(a[5])! : 12
 let warpV = a.count > 6 ? Int(a[6])! : 30   // expérience : sommets par warp (30 = DXMT)
+let noRaster = ProcessInfo.processInfo.environment["NORASTER"] != nil   // coût de la géométrie seule
 let dev = MTLCreateSystemDefaultDevice()!
 let q = dev.makeCommandQueue()!
 let src = try! String(contentsOfFile: (a[0] as NSString).deletingLastPathComponent + "/gs.metal")
 
+var pso3A: MTLRenderPipelineState! = nil, pso3B: MTLRenderPipelineState! = nil   // cascade 3 avec troncature (mode 5)
 func pipeline(nreg: Int) -> MTLRenderPipelineState {
   let o = MTLCompileOptions()
   let payloadWords = payloadWords == 0 ? 4 + warpV * nreg * 4 + 4 : payloadWords   // 0 = au plus juste
-  o.preprocessorMacros = ["PAYLOAD_WORDS": NSNumber(value: payloadWords), "MESH_MODE": NSNumber(value: mode),
+  o.preprocessorMacros = ["NCASC": NSNumber(value: mode == 5 ? 3 : 4), "PAYLOAD_WORDS": NSNumber(value: payloadWords), "MESH_MODE": NSNumber(value: mode),
                           "PACK": NSNumber(value: pack), "NREG": NSNumber(value: nreg), "WARP_V": NSNumber(value: warpV)]
   o.languageVersion = .version3_2
   let lib = try! dev.makeLibrary(source: src, options: o)
+  if mode >= 4 {
+    let d = MTLRenderPipelineDescriptor()
+    d.vertexFunction = lib.makeFunction(name: "vroute"); d.fragmentFunction = lib.makeFunction(name: "fragL")
+    d.depthAttachmentPixelFormat = .depth32Float; d.inputPrimitiveTopology = .triangle
+    let p = try! dev.makeRenderPipelineState(descriptor: d)
+    d.vertexFunction = lib.makeFunction(name: "vroute3")
+    let p3 = try! dev.makeRenderPipelineState(descriptor: d)
+    if nreg == 1 { pso3A = p3 } else { pso3B = p3 }
+    return p
+  }
   let d = MTLMeshRenderPipelineDescriptor()
   d.objectFunction = lib.makeFunction(name: "obj")
   d.meshFunction = lib.makeFunction(name: "meshfn")
@@ -26,12 +40,14 @@ func pipeline(nreg: Int) -> MTLRenderPipelineState {
   d.maxTotalThreadsPerObjectThreadgroup = warpV
   d.maxTotalThreadsPerMeshThreadgroup = mode >= 2 ? warpV / 3 : 1
   d.depthAttachmentPixelFormat = .depth32Float
+  d.isRasterizationEnabled = !noRaster
   return try! dev.makeRenderPipelineState(descriptor: d, options: []).0
 }
 
 // Cible : atlas d'ombres 4 couches
 let td = MTLTextureDescriptor()
-td.textureType = .type2DArray; td.pixelFormat = .depth32Float; td.width = 4096; td.height = 4096
+td.textureType = .type2DArray; td.pixelFormat = .depth32Float; let rt = Int(ProcessInfo.processInfo.environment["RT"] ?? "4096")!   // RT=64 : remplissage négligeable, reste la géométrie
+td.width = rt; td.height = rt
 td.arrayLength = 4; td.usage = .renderTarget; td.storageMode = .private
 let depth = dev.makeTexture(descriptor: td)!
 let dsd = MTLDepthStencilDescriptor(); dsd.depthCompareFunction = .less; dsd.isDepthWriteEnabled = true
@@ -79,21 +95,47 @@ func frame() -> Double {
   if workload.contains("A") {
     e.setRenderPipelineState(psoA)
     e.setObjectBuffer(bIA, offset: 0, index: 0); e.setObjectBuffer(bVA, offset: 0, index: 1)
-    for i in 0..<drawsA {
-      e.setObjectBufferOffset(i * stride, index: 2)
-      e.drawMeshThreadgroups(MTLSize(width: (trisA * 3 - 1) / warpV + 1, height: 1, depth: 1),
-                             threadsPerObjectThreadgroup: MTLSize(width: 30, height: 1, depth: 1), threadsPerMeshThreadgroup: meshThreads)
+    if mode >= 4 {
+      let nc = mode == 5 ? 3 : 4
+      for b in [(bIA, 0), (bVA, 1), (bInst, 3), (bUni, 4), (bCasc, 5)] { e.setVertexBuffer(b.0, offset: 0, index: b.1) }
+      for pass in 0..<(mode == 5 ? 2 : 1) {
+        e.setRenderPipelineState(pass == 0 ? psoA : pso3A)
+        for i in 0..<drawsA {
+          e.setVertexBuffer(bArgs, offset: i * stride, index: 2)
+          if pass == 0 { e.drawIndexedPrimitives(type: .triangle, indexCount: trisA * 3, indexType: .uint16, indexBuffer: bIA, indexBufferOffset: 0, instanceCount: nc) }
+          else { e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: trisA * 3, instanceCount: 1) }
+        }
+      }
+    } else {
+      for i in 0..<drawsA {
+        e.setObjectBufferOffset(i * stride, index: 2)
+        e.drawMeshThreadgroups(MTLSize(width: (trisA * 3 - 1) / warpV + 1, height: 1, depth: 1),
+                               threadsPerObjectThreadgroup: MTLSize(width: warpV, height: 1, depth: 1), threadsPerMeshThreadgroup: meshThreads)
+      }
     }
   }
   if workload.contains("B") {
     e.setRenderPipelineState(psoB)
     e.setObjectBuffer(bIB, offset: 0, index: 0); e.setObjectBuffer(bVB, offset: 0, index: 1)
-    for i in 0..<drawsB {
-      e.setObjectBufferOffset((drawsA + i) * stride, index: 2)
-      let k = warpV / 6
-      let groups = pack == 1 ? (instB + k - 1) / k : instB
-      e.drawMeshThreadgroups(MTLSize(width: 1, height: groups, depth: 1),
-                             threadsPerObjectThreadgroup: MTLSize(width: warpV, height: 1, depth: 1), threadsPerMeshThreadgroup: meshThreads)
+    if mode >= 4 {
+      let nc = mode == 5 ? 3 : 4
+      for b in [(bIB, 0), (bVB, 1), (bInst, 3), (bUni, 4), (bCasc, 5)] { e.setVertexBuffer(b.0, offset: 0, index: b.1) }
+      for pass in 0..<(mode == 5 ? 2 : 1) {
+        e.setRenderPipelineState(pass == 0 ? psoB : pso3B)
+        for i in 0..<drawsB {
+          e.setVertexBuffer(bArgs, offset: (drawsA + i) * stride, index: 2)
+          if pass == 0 { e.drawIndexedPrimitives(type: .triangle, indexCount: 6, indexType: .uint16, indexBuffer: bIB, indexBufferOffset: 0, instanceCount: instB * nc) }
+          else { e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6, instanceCount: instB) }
+        }
+      }
+    } else {
+      for i in 0..<drawsB {
+        e.setObjectBufferOffset((drawsA + i) * stride, index: 2)
+        let k = warpV / 6
+        let groups = pack == 1 ? (instB + k - 1) / k : instB
+        e.drawMeshThreadgroups(MTLSize(width: 1, height: groups, depth: 1),
+                               threadsPerObjectThreadgroup: MTLSize(width: warpV, height: 1, depth: 1), threadsPerMeshThreadgroup: meshThreads)
+      }
     }
   }
   e.endEncoding()

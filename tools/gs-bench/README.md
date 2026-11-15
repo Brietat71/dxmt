@@ -33,6 +33,7 @@ L'empreinte `profondeur` doit être identique entre `legacy` et `new` pour chaqu
 `NORASTER=1` coupe la rastérisation : coût de la géométrie seule. Le banc recopie ce que font `GeometryDraw*` et `d3d11_pipeline_gs.cpp` : à tenir à jour.
 
 Contrôle négatif : `./real libs/new B legacy` donne une autre empreinte.
+Données adverses : `ADV=casc0|cascmax|instnan|inst0|insthuge` (cascades nulles ou à INT_MAX, instances NaN, nulles, quads géants).
 
 ## `bench.swift` + `gs.metal` : modèle synthétique en MSL
 
@@ -44,4 +45,7 @@ swiftc -O bench.swift -o bench
 ./bench <A|B|AB> <mode 0..3> <mots de payload, 0 = au plus juste> <pack 0|1> [frames] [sommets par warp]
 ```
 
-Modes : 0 = d'origine, 1 = grille mesh = primitives valides, 2 = un threadgroup + atomiques, 3 = un threadgroup + préfixe en 2 passes.
+Modes : 0 = d'origine, 1 = grille mesh = primitives valides, 2 = un threadgroup + atomiques, 3 = un threadgroup + préfixe en 2 passes,
+4 = routage par cascade en pipeline vertex (draw instancié × 4 cascades, sans troncature `maxvertexcount`, inexact),
+5 = idem exact (cascades 0 à 2 instanciées, cascade 3 non indexée avec la troncature).
+`RT=64` réduit la cible : remplissage négligeable, reste la géométrie.
