@@ -46,6 +46,20 @@ static cl::opt<std::string>
 static cl::opt<std::string>
   GeometryAfterVertex("geometry-after-vertex", cl::desc("Compile vertex shader with supplied geometry shader"));
 
+static cl::opt<std::string> IALayout(
+  "ia-layout",
+  cl::desc("With --geometry-after-vertex: pull vertex inputs from vertex buffers, as the runtime does. "
+           "Comma separated reg:slot:offset:format[:steprate], format is a MTLAttributeFormat, steprate makes it per-instance")
+);
+
+static cl::opt<unsigned> IAIndexFormat(
+  "ia-index-format", cl::init(0), cl::desc("With --geometry-after-vertex: 0 non-indexed, 1 uint16, 2 uint32")
+);
+
+static cl::opt<bool> GSStrip(
+  "gs-strip", cl::init(false), cl::desc("Geometry pipeline: the input assembler topology is a strip")
+);
+
 static cl::opt<bool>
   EmitLLVM("S", cl::init(false), cl::desc("Write output as LLVM assembly"));
 
@@ -221,6 +235,12 @@ int main(int argc, char **argv) {
   data.next = 0;
   data.type = SM50_SHADER_COMMON;
 
+  SM50_SHADER_PSO_GEOMETRY_SHADER_DATA gs_data = {};
+  gs_data.type = SM50_SHADER_PSO_GEOMETRY_SHADER;
+  gs_data.strip_topology = GSStrip;
+  if (GSStrip)
+    data.next = &gs_data;
+
   if (!HullBeforeDomain.getValue().empty()) {
     ErrorOr<std::unique_ptr<MemoryBuffer>> FileOrErr =
       MemoryBuffer::getFile(HullBeforeDomain, /*IsText=*/false);
@@ -353,6 +373,27 @@ int main(int argc, char **argv) {
       errs() << SM50GetErrorMessageString(err) << '\n';
       SM50FreeError(err);
       return 1;
+    }
+    std::vector<SM50_IA_INPUT_ELEMENT> ia_elements;
+    SM50_SHADER_IA_INPUT_LAYOUT_DATA ia_layout = {};
+    ia_layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
+    ia_layout.index_buffer_format = (SM50_INDEX_BUFFER_FORMAT)IAIndexFormat.getValue();
+    SmallVector<StringRef, 8> ia_element_specs;
+    StringRef(IALayout).split(ia_element_specs, ',', -1, false);
+    for (auto spec : ia_element_specs) {
+      SmallVector<StringRef, 5> fields;
+      spec.split(fields, ':');
+      unsigned value[5] = {};
+      for (unsigned i = 0; i < fields.size() && i < 5; i++)
+        fields[i].getAsInteger(10, value[i]);
+      ia_elements.push_back({value[0], value[1], value[2], value[3], fields.size() > 4, value[4]});
+      ia_layout.slot_mask |= 1u << value[1];
+    }
+    ia_layout.num_elements = ia_elements.size();
+    ia_layout.elements = ia_elements.data();
+    if (!ia_elements.empty() || IAIndexFormat) {
+      ia_layout.next = data.next;
+      data.next = &ia_layout;
     }
     if (auto err = dxmt::dxbc::convert_dxbc_vertex_for_geometry_shader(
           (dxmt::dxbc::SM50ShaderInternal *)sm50, "shader_main",
