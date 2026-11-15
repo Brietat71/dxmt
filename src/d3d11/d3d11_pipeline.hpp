@@ -58,6 +58,10 @@ template <> struct hash<MTL_GRAPHICS_PIPELINE_DESC> {
     state.add((size_t)v.InputLayout);
     /* don't add blend */
     // state.add((size_t)v.BlendState);
+    /* neutron: but its content: with pixel shader and blend state switching per draw, all blend
+       variants of a shader set shared one bucket and every lookup compared blend descs by value */
+    if (v.BlendState)
+      state.add(v.BlendState->GetPipelineHash(v.NumColorAttachments));
     state.add((size_t)v.DepthStencilFormat);
     state.add((size_t)v.TopologyClass);
     state.add((size_t)v.IndexBufferFormat);

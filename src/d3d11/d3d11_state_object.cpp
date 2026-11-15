@@ -261,8 +261,41 @@ public:
          desc_.RenderTarget[0].SrcBlendAlpha >= D3D11_BLEND_SRC1_COLOR ||
          desc_.RenderTarget[0].DestBlendAlpha >= D3D11_BLEND_SRC1_COLOR ||
          desc_.RenderTarget[0].DestBlend >= D3D11_BLEND_SRC1_COLOR);
+    /* neutron: precompute the pipeline key hash. Only fields that equal_to<MTL_GRAPHICS_PIPELINE_DESC>
+       compares go in: the flags always, render target 0 unless independent blending with no color
+       attachment (then no target is compared); the other targets are left out, they are only
+       compared with independent blending. */
+    HashState flags;
+    flags.add(desc_.IndependentBlendEnable);
+    flags.add(desc_.AlphaToCoverageEnable);
+    pipeline_hash_flags_ = flags;
+    auto &rt = desc_.RenderTarget[0];
+    HashState rt0;
+    rt0.add(rt.RenderTargetWriteMask);
+    rt0.add(rt.BlendEnable);
+    rt0.add(rt.LogicOpEnable);
+    if (rt.BlendEnable) {
+      rt0.add(rt.BlendOp);
+      rt0.add(rt.BlendOpAlpha);
+      rt0.add(rt.SrcBlend);
+      rt0.add(rt.SrcBlendAlpha);
+      rt0.add(rt.DestBlend);
+      rt0.add(rt.DestBlendAlpha);
+    }
+    if (rt.LogicOpEnable)
+      rt0.add(rt.LogicOp);
+    pipeline_hash_rt0_ = rt0;
   }
   ~MTLD3D11BlendState() {}
+
+  size_t GetPipelineHash(uint32_t num_color_attachments) final {
+    if (desc_.IndependentBlendEnable && !num_color_attachments)
+      return pipeline_hash_flags_;
+    HashState state;
+    state.add(pipeline_hash_flags_);
+    state.add(pipeline_hash_rt0_);
+    return state;
+  }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
                                            void **ppvObject) final {
@@ -357,6 +390,8 @@ public:
 private:
   const D3D11_BLEND_DESC1 desc_;
   bool dual_source_blending_;
+  size_t pipeline_hash_flags_;
+  size_t pipeline_hash_rt0_;
   MTLD3D10BlendState d3d10_;
 };
 

@@ -28,6 +28,8 @@ DEFINE_COM_INTERFACE("279a1d66-2fc1-460c-a0a7-a7a5f2b7a48f",
     : public ID3D11BlendState1 {
   virtual bool IsDualSourceBlending() = 0;
   virtual void SetupMetalPipelineDescriptor(WMTRenderPipelineBlendInfo* blend_info, uint32_t num_rt, uint32_t valid_rt) = 0;
+  /* neutron: hash of the fields equal_to<MTL_GRAPHICS_PIPELINE_DESC> compares */
+  virtual size_t GetPipelineHash(uint32_t num_color_attachments) = 0;
 };
 
 namespace std {
