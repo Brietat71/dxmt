@@ -1075,6 +1075,8 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           uint64_t max_object_threadgroups;
           uint32_t vertex_count_per_warp;
           uint32_t end_of_command;
+          uint32_t pack_vertex_per_warp;
+          uint32_t pack_unit;
         };
         auto [mapped_task_data, task_data_buffer, task_data_buffer_offset] =
             queue_.AllocateArgumentBuffer(seq_id_, sizeof(GS_MARSHAL_TASK) * task_count);
@@ -1085,6 +1087,8 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           tasks_data[i].dispatch_args_out = task.dispatch_arguments_va;
           tasks_data[i].max_object_threadgroups = task.max_object_threadgroups;
           tasks_data[i].vertex_count_per_warp = task.vertex_count_per_warp;
+          tasks_data[i].pack_vertex_per_warp = task.pack_vertex_per_warp;
+          tasks_data[i].pack_unit = task.pack_unit;
           tasks_data[i].end_of_command = 0;
           encoder.useResource(task.draw_arguments, WMTResourceUsageRead, WMTRenderStageVertex);
           encoder.useResource(task.dispatch_arguments_buffer, WMTResourceUsageWrite, WMTRenderStageVertex);

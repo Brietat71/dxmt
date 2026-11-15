@@ -96,6 +96,16 @@ get_vertex_primitive_count_in_warp(D3D10_SB_PRIMITIVE primitive, bool strip) {
   return {0, 0, 0};
 }
 
+uint32_t
+gs_mesh_threads(const SM50ShaderInternal *pGeometryStage, bool strip) {
+  // ponytail: a DXIL geometry shader keeps one invocation per mesh threadgroup, the two-pass
+  // conversion below has only been exercised with DXBC. Batch them when a DXIL GS workload shows up.
+  if (pGeometryStage->dxil)
+    return 1;
+  auto primitives_in_warp = std::get<1>(get_vertex_primitive_count_in_warp(pGeometryStage->gs_input_primitive, strip));
+  return std::max(1u, SM50GSMeshThreads(primitives_in_warp, pGeometryStage->gs_max_vertex_output));
+}
+
 llvm::Error
 convert_dxbc_geometry_shader(
     SM50ShaderInternal *pShaderInternal, const char *name, SM50ShaderInternal *pVertexStage, llvm::LLVMContext &context,
@@ -158,10 +168,36 @@ convert_dxbc_geometry_shader(
     return llvm::make_error<UnsupportedFeature>("unsupported geometry shader output topology");
   }
 
-  uint32_t payload_idx = func_signature.DefineInput(air::InputPayload{.size = 16256});
-  // it's intended to declare a bit more max primitive count
-  auto mesh_idx = func_signature.DefineInput(air::InputMesh{(uint32_t)max_vertex_out, (uint32_t)max_vertex_out, topology});
+  auto [warp_vertex_count, warp_primitive_count, vertex_per_primitive] =
+      get_vertex_primitive_count_in_warp(pShaderInternal->gs_input_primitive, is_strip);
+
+  /*
+   * Batched layout: a mesh threadgroup runs `mesh_threads` GS invocations, one per thread.
+   * A first pass over the GS body counts what each invocation emits, a prefix sum over the
+   * threadgroup gives each thread its slice of the mesh, a second pass writes it. The mesh
+   * stays compact and in input primitive order.
+   */
+  const uint32_t mesh_threads = gs_mesh_threads(pShaderInternal, is_strip);
+  const bool batched = mesh_threads > 1;
+  // a primitive slot is (speculatively) written for each emitted vertex, see call_emit
+  uint32_t max_primitive_out = max_vertex_out;
+  if (batched && topology == air::MeshOutputTopology::Triangle)
+    max_primitive_out = std::max(max_vertex_out, 2) - 2;
+  if (batched && topology == air::MeshOutputTopology::Line)
+    max_primitive_out = std::max(max_vertex_out, 1) - 1;
+  // batched: speculative writes that fall out of a thread's slice go to its scratch vertex/primitive
+  const uint32_t scratch_vertex_base = mesh_threads * max_vertex_out;
+  const uint32_t scratch_primitive_base = mesh_threads * max_primitive_out;
+
+  uint32_t payload_idx =
+      func_signature.DefineInput(air::InputPayload{.size = SM50GSPayloadSize(pVertexStage->max_output_register)});
+  auto mesh_idx = func_signature.DefineInput(
+      batched ? air::InputMesh{scratch_vertex_base + mesh_threads, scratch_primitive_base + mesh_threads, topology}
+              // it's intended to declare a bit more max primitive count
+              : air::InputMesh{(uint32_t)max_vertex_out, (uint32_t)max_vertex_out, topology}
+  );
   uint32_t tg_in_grid_idx = func_signature.DefineInput(air::InputThreadgroupPositionInGrid{});
+  uint32_t thread_idx = batched ? func_signature.DefineInput(air::InputThreadPositionInThreadgroup{}) : ~0u;
 
   if (pShaderInternal->clip_distance_scalars.size() > 0) {
     func_signature.DefineMeshVertexOutput(
@@ -185,10 +221,14 @@ convert_dxbc_geometry_shader(
   );
   setup_metal_version(module, metal_version);
 
-  auto [warp_vertex_count, warp_primitive_count, vertex_per_primitive] =
-      get_vertex_primitive_count_in_warp(pShaderInternal->gs_input_primitive, is_strip);
   auto tg_position_in_grid = function->getArg(tg_in_grid_idx);
-  auto primitive_id_in_warp = builder.CreateExtractElement(tg_position_in_grid, (uint32_t)0);
+  pvalue primitive_id_in_warp = builder.CreateExtractElement(tg_position_in_grid, (uint32_t)0);
+  pvalue thread_id = builder.getInt32(0);
+  if (batched) {
+    thread_id = builder.CreateExtractElement(function->getArg(thread_idx), (uint32_t)0);
+    primitive_id_in_warp =
+        builder.CreateAdd(builder.CreateMul(primitive_id_in_warp, builder.getInt32(mesh_threads)), thread_id);
+  }
   resource_map.gs_instance_id = builder.CreateExtractElement(tg_position_in_grid, (uint32_t)1);
 
   auto const zero_const = builder.getInt32(0);
@@ -219,24 +259,71 @@ convert_dxbc_geometry_shader(
 
   IOHelper io(air, function, types, resource_map);
 
+  // batched only
+  bool count_only = false; // converting the counting pass: emit/cut only maintain the counters
+  pvalue end_vertex = nullptr, end_primitive = nullptr; // end of the thread's slice of the mesh
+  pvalue scratch_vertex = nullptr, scratch_primitive = nullptr;
+  llvm::AllocaInst *emitted_vertices = nullptr;
+  if (batched) {
+    emitted_vertices = builder.CreateAlloca(types._int, nullptr, "emitted_vertices");
+    builder.CreateStore(zero_const, emitted_vertices);
+  }
+  pvalue emit_accepted = nullptr;
+  /*
+   * Returns the increment of the vertex counters for this emit. A slice holds maxvertexcount
+   * vertices: as D3D does, ignore what the GS emits past it.
+   */
+  auto begin_emit = [&]() -> pvalue {
+    if (!batched)
+      return one_const;
+    auto emitted = builder.CreateLoad(types._int, emitted_vertices);
+    emit_accepted = builder.CreateICmpULT(emitted, builder.getInt32(max_vertex_out));
+    auto increment = builder.CreateZExt(emit_accepted, types._int);
+    builder.CreateStore(builder.CreateAdd(emitted, increment), emitted_vertices);
+    return increment;
+  };
+  /*
+   * A vertex is written before its strip is known to be valid, and so is the primitive it leads.
+   * Within the slice, such a write is overwritten by the next valid strip; past its end it would
+   * land in the next thread's slice: redirect it to the scratch slot.
+   */
+  auto vertex_slot = [&](pvalue vertex) {
+    return batched ? builder.CreateSelect(
+                         builder.CreateAnd(emit_accepted, builder.CreateICmpULT(vertex, end_vertex)), vertex,
+                         scratch_vertex
+                     )
+                   : vertex;
+  };
+  auto primitive_slot = [&](pvalue primitive) {
+    return batched ? builder.CreateSelect(
+                         builder.CreateAnd(emit_accepted, builder.CreateICmpULT(primitive, end_primitive)), primitive,
+                         scratch_primitive
+                     )
+                   : primitive;
+  };
+
   if (topology == air::MeshOutputTopology::Triangle) {
     resource_map.call_emit = [&]() {
       auto current_write_vertex = builder.CreateLoad(types._int, next_write_vertex);
+      builder.CreateStore(builder.CreateAdd(begin_emit(), current_write_vertex), next_write_vertex);
+      if (count_only)
+        return;
       auto current_vertex_offset = builder.CreateLoad(types._int, vertex_offset);
       auto current_vertex_with_offset = builder.CreateAdd(current_vertex_offset, current_write_vertex);
 
       auto current_primitive_count = builder.CreateLoad(types._int, primitive_count);
-      auto current_primitive_idx = builder.CreateAdd(current_primitive_count, current_write_vertex);
+      auto current_primitive_idx = primitive_slot(builder.CreateAdd(current_primitive_count, current_write_vertex));
 
       auto even_winding = builder.CreateZExt(
           builder.CreateICmpEQ(zero_const, builder.CreateAnd(current_write_vertex, one_const)), types._int
       );
 
-      MeshOutputContext gs_out_ctx{current_vertex_with_offset, current_primitive_idx};
+      auto current_vertex_slot = vertex_slot(current_vertex_with_offset);
+      MeshOutputContext gs_out_ctx{current_vertex_slot, current_primitive_idx};
       for (auto &h : gs_output_handlers) {
         h(gs_out_ctx, io);
       }
-      emit_clip_distances(current_vertex_with_offset);
+      emit_clip_distances(current_vertex_slot);
 
       auto triple_primitive_idx = builder.CreateMul(current_primitive_idx, builder.getInt32(3));
       air.CreateSetMeshIndex(
@@ -250,8 +337,6 @@ convert_dxbc_geometry_shader(
           builder.CreateAdd(triple_primitive_idx, two_const),
           builder.CreateAdd(builder.CreateAdd(current_vertex_with_offset, one_const), even_winding)
       );
-
-      builder.CreateStore(builder.CreateAdd(one_const, current_write_vertex), next_write_vertex);
     };
     resource_map.call_cut = [&]() {
       auto current_write_vertex = builder.CreateLoad(types._int, next_write_vertex);
@@ -272,19 +357,22 @@ convert_dxbc_geometry_shader(
   } else if (topology == air::MeshOutputTopology::Line) {
     resource_map.call_emit = [&]() {
       auto current_write_vertex = builder.CreateLoad(types._int, next_write_vertex);
-      builder.CreateStore(builder.CreateAdd(one_const, current_write_vertex), next_write_vertex);
+      builder.CreateStore(builder.CreateAdd(begin_emit(), current_write_vertex), next_write_vertex);
+      if (count_only)
+        return;
 
       auto current_vertex_offset = builder.CreateLoad(types._int, vertex_offset);
       auto current_vertex_with_offset = builder.CreateAdd(current_vertex_offset, current_write_vertex);
 
       auto current_primitive_count = builder.CreateLoad(types._int, primitive_count);
-      auto current_primitive_idx = builder.CreateAdd(current_primitive_count, current_write_vertex);
+      auto current_primitive_idx = primitive_slot(builder.CreateAdd(current_primitive_count, current_write_vertex));
 
-      MeshOutputContext gs_out_ctx{current_vertex_with_offset, current_primitive_idx};
+      auto current_vertex_slot = vertex_slot(current_vertex_with_offset);
+      MeshOutputContext gs_out_ctx{current_vertex_slot, current_primitive_idx};
       for (auto &h : gs_output_handlers) {
         h(gs_out_ctx, io);
       }
-      emit_clip_distances(current_vertex_with_offset);
+      emit_clip_distances(current_vertex_slot);
 
       auto double_primitive_idx = builder.CreateMul(current_primitive_idx, builder.getInt32(2));
       air.CreateSetMeshIndex(
@@ -315,15 +403,19 @@ convert_dxbc_geometry_shader(
     resource_map.call_emit = [&]() {
       // only one accumulator to maintain, simple one ~
       auto current_write_vertex = builder.CreateLoad(types._int, next_write_vertex);
-      builder.CreateStore(builder.CreateAdd(one_const, current_write_vertex), next_write_vertex);
+      builder.CreateStore(builder.CreateAdd(begin_emit(), current_write_vertex), next_write_vertex);
+      if (count_only)
+        return;
 
-      MeshOutputContext gs_out_ctx{current_write_vertex, current_write_vertex};
+      // a point is its own primitive: vertex_offset is the start of the thread's slice (0 if not batched)
+      auto current_point = vertex_slot(builder.CreateAdd(builder.CreateLoad(types._int, vertex_offset), current_write_vertex));
+      MeshOutputContext gs_out_ctx{current_point, current_point};
       for (auto &h : gs_output_handlers) {
         h(gs_out_ctx, io);
       }
-      emit_clip_distances(current_write_vertex);
-      air.CreateSetMeshPointSize(current_write_vertex, air.getFloat(1.0));
-      air.CreateSetMeshIndex(current_write_vertex, current_write_vertex);
+      emit_clip_distances(current_point);
+      air.CreateSetMeshPointSize(current_point, air.getFloat(1.0));
+      air.CreateSetMeshIndex(current_point, current_point);
     };
     resource_map.call_cut = []() {
       // there is nothing to cut!
@@ -333,10 +425,14 @@ convert_dxbc_geometry_shader(
   auto payload = function->getArg(payload_idx);
   auto valid_primitive_mask =
       builder.CreateLoad(types._int, builder.CreateConstInBoundsGEP1_32(types._int, payload, 1));
-  auto warp_id =
+  auto primitive_id_base =
       builder.CreateLoad(types._int, builder.CreateConstInBoundsGEP1_32(types._int, payload, 2));
+  // primitives per instance when the object shader packs several instances in the warp, ~0u otherwise
+  auto primitive_id_modulus =
+      builder.CreateLoad(types._int, builder.CreateConstInBoundsGEP1_32(types._int, payload, 3));
 
-  resource_map.patch_id = builder.CreateAdd(builder.CreateMul(warp_id, builder.getInt32(warp_primitive_count)), primitive_id_in_warp);
+  resource_map.patch_id =
+      builder.CreateAdd(primitive_id_base, builder.CreateURem(primitive_id_in_warp, primitive_id_modulus));
 
   auto input_per_vertex_type = llvm::ArrayType::get(types._int4, pVertexStage->max_output_register);
   auto input_per_vertex_type_float = llvm::ArrayType::get(types._float4, pVertexStage->max_output_register);
@@ -358,12 +454,20 @@ convert_dxbc_geometry_shader(
   setup_temp_register(shader_info, resource_map, types, module, builder);
   setup_immediate_constant_buffer(shader_info, resource_map, types, module, builder);
 
-  builder.CreateCondBr(
+  auto sync_bb = batched ? llvm::BasicBlock::Create(context, "sync", function) : nullptr;
+  // the last threadgroup of the warp may run more threads than there are primitives left
+  auto is_valid = builder.CreateAnd(
+      builder.CreateICmpULT(primitive_id_in_warp, builder.getInt32(warp_primitive_count)),
       builder.CreateICmpNE(
-          builder.CreateAnd(valid_primitive_mask, builder.CreateShl(one_const, primitive_id_in_warp)), zero_const
-      ),
-      active_, epilogue_bb
+          builder.CreateAnd(
+              builder.CreateLShr(valid_primitive_mask, builder.CreateAnd(primitive_id_in_warp, builder.getInt32(31))),
+              one_const
+          ),
+          zero_const
+      )
   );
+  auto entry_exit_bb = builder.GetInsertBlock();
+  builder.CreateCondBr(is_valid, active_, batched ? sync_bb : epilogue_bb);
   builder.SetInsertPoint(active_);
 
   auto vertices_ptr = builder.CreateBitCast(
@@ -492,9 +596,83 @@ convert_dxbc_geometry_shader(
     return err;
   }
 
-  llvm::Expected<llvm::BasicBlock *> real_entry =
-      pShaderInternal->dxil ? dxil::convert_basicblocks(pShaderInternal->dxil_entry,  ctx, epilogue_bb)
-                            : convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
+  auto convert_body = [&](llvm::BasicBlock *return_bb) {
+    return pShaderInternal->dxil ? dxil::convert_basicblocks(pShaderInternal->dxil_entry, ctx, return_bb)
+                                 : convert_basicblocks(pShaderInternal->entry(), ctx, return_bb);
+  };
+
+  if (batched) {
+    // pass 1: count. The GS has no side effect but its emits, so what it computes for them is dead code here.
+    auto count_end_bb = llvm::BasicBlock::Create(context, "count_end", function);
+    auto set_count_bb = llvm::BasicBlock::Create(context, "set_count", function);
+    auto synced_bb = llvm::BasicBlock::Create(context, "synced", function);
+    auto write_bb = llvm::BasicBlock::Create(context, "write", function);
+
+    count_only = true;
+    auto count_entry = convert_body(count_end_bb);
+    count_only = false;
+    if (auto err = count_entry.takeError()) {
+      return err;
+    }
+    builder.CreateBr(count_entry.get());
+
+    builder.SetInsertPoint(count_end_bb);
+    resource_map.call_cut();
+    auto vertex_emitted =
+        builder.CreateLoad(types._int, topology == air::MeshOutputTopology::Point ? next_write_vertex : vertex_offset);
+    auto primitive_emitted = topology == air::MeshOutputTopology::Point
+                                 ? vertex_emitted
+                                 : builder.CreateLoad(types._int, primitive_count);
+    // at most maxvertexcount vertices (see begin_emit), so at most max_primitive_out primitives: it fits the slice
+    auto emitted = builder.CreateOr(vertex_emitted, builder.CreateShl(primitive_emitted, 16));
+    auto count_exit_bb = builder.GetInsertBlock();
+    builder.CreateBr(sync_bb);
+
+    // prefix sum of (vertex | primitive << 16) counts over the threadgroup
+    builder.SetInsertPoint(sync_bb);
+    auto own_count = builder.CreatePHI(types._int, 2);
+    own_count->addIncoming(zero_const, entry_exit_bb);
+    own_count->addIncoming(emitted, count_exit_bb);
+    auto counts_type = llvm::ArrayType::get(types._int, mesh_threads);
+    auto counts = new llvm::GlobalVariable(
+        module, counts_type, false, llvm::GlobalValue::InternalLinkage, llvm::Constant::getNullValue(counts_type),
+        "gs_emit_counts", nullptr, llvm::GlobalValue::NotThreadLocal, (uint32_t)air::AddressSpace::threadgroup
+    );
+    builder.CreateStore(own_count, builder.CreateGEP(counts_type, counts, {zero_const, thread_id}));
+    air.CreateBarrier(llvm::air::MemFlags::Threadgroup);
+    pvalue count_before = zero_const, count_total = zero_const;
+    for (uint32_t thread = 0; thread < mesh_threads; thread++) {
+      auto count =
+          builder.CreateLoad(types._int, builder.CreateGEP(counts_type, counts, {zero_const, builder.getInt32(thread)}));
+      count_total = builder.CreateAdd(count_total, count);
+      count_before = builder.CreateAdd(
+          count_before, builder.CreateSelect(builder.CreateICmpULT(builder.getInt32(thread), thread_id), count, zero_const)
+      );
+    }
+    builder.CreateCondBr(builder.CreateICmpEQ(thread_id, zero_const), set_count_bb, synced_bb);
+
+    builder.SetInsertPoint(set_count_bb);
+    air.CreateSetMeshPrimitiveCount(builder.CreateLShr(count_total, 16));
+    builder.CreateBr(synced_bb);
+
+    builder.SetInsertPoint(synced_bb);
+    builder.CreateCondBr(is_valid, write_bb, epilogue_bb);
+
+    // pass 2: write, from the start of the thread's slice
+    builder.SetInsertPoint(write_bb);
+    auto first_vertex = builder.CreateAnd(count_before, 0xffff);
+    auto first_primitive = builder.CreateLShr(count_before, 16);
+    end_vertex = builder.CreateAdd(first_vertex, builder.CreateAnd(own_count, 0xffff));
+    end_primitive = builder.CreateAdd(first_primitive, builder.CreateLShr(own_count, 16));
+    scratch_vertex = builder.CreateAdd(thread_id, builder.getInt32(scratch_vertex_base));
+    scratch_primitive = builder.CreateAdd(thread_id, builder.getInt32(scratch_primitive_base));
+    builder.CreateStore(zero_const, next_write_vertex);
+    builder.CreateStore(zero_const, emitted_vertices);
+    builder.CreateStore(first_vertex, vertex_offset);
+    builder.CreateStore(first_primitive, primitive_count);
+  }
+
+  auto real_entry = convert_body(epilogue_bb);
   if (auto err = real_entry.takeError()) {
     return err;
   }
@@ -505,11 +683,13 @@ convert_dxbc_geometry_shader(
   if (auto err = epilogue_result.takeError()) {
     return err;
   }
-  resource_map.call_cut();
-  if (topology == air::MeshOutputTopology::Point)
-    air.CreateSetMeshPrimitiveCount(builder.CreateLoad(types._int, next_write_vertex));
-  else
-    air.CreateSetMeshPrimitiveCount(builder.CreateLoad(types._int, primitive_count));
+  if (!batched) {
+    resource_map.call_cut();
+    if (topology == air::MeshOutputTopology::Point)
+      air.CreateSetMeshPrimitiveCount(builder.CreateLoad(types._int, next_write_vertex));
+    else
+      air.CreateSetMeshPrimitiveCount(builder.CreateLoad(types._int, primitive_count));
+  }
 
   builder.CreateRetVoid();
   module.getOrInsertNamedMetadata("air.mesh")->addOperand(function_metadata);
@@ -570,7 +750,7 @@ convert_dxbc_vertex_for_geometry_shader(
                                )
                              : setup_binding_table2(shader_info, func_signature, module);
 
-  uint32_t payload_idx = func_signature.DefineInput(air::InputPayload{.size = 16256});
+  uint32_t payload_idx = func_signature.DefineInput(air::InputPayload{.size = SM50GSPayloadSize(max_output_register)});
   // (warp_size, 1, 1)
   uint32_t thread_id_idx = func_signature.DefineInput(air::InputThreadPositionInThreadgroup{});
   // (warp_count, instance_count, 1)
@@ -634,7 +814,7 @@ convert_dxbc_vertex_for_geometry_shader(
 
   auto threadgroup_position_in_grid = function->getArg(tg_id_idx);
   auto warp_id = builder.CreateExtractElement(threadgroup_position_in_grid, (uint32_t)0);
-  auto instance_id = builder.CreateExtractElement(threadgroup_position_in_grid, (uint32_t)1);
+  pvalue instance_id = builder.CreateExtractElement(threadgroup_position_in_grid, (uint32_t)1);
 
   auto draw_arguments = builder.CreateLoad(
     is_indexed_draw ? is_dyanmic_ib ? types._dxmt_draw_dyn_ib_arguments : types._dxmt_draw_indexed_arguments
@@ -698,8 +878,47 @@ convert_dxbc_vertex_for_geometry_shader(
       .metal_version = metal_version,
   };
 
-  auto global_index_id =
+  pvalue global_index_id =
       builder.CreateAdd(builder.CreateMul(warp_id, builder.getInt32(warp_vertex_count)), warp_vertex_id);
+  pvalue in_draw_range = nullptr; // defaults to global_index_id < vertex_count
+  pvalue primitive_id_modulus = builder.getInt32(~0u);
+
+  if (!is_strip && vertex_per_primitive) {
+    /*
+     * Instance packing, see SM50GSInstancesPerWarp(): a draw of few vertices and many instances
+     * (instanced quads...) would run one mostly idle threadgroup per instance. Fill the warp with
+     * several instances instead: thread -> (instance, vertex), the grid being (1, ceil(instances / packed)).
+     */
+    auto instance_count = builder.CreateExtractValue(draw_arguments, 1);
+    auto packable = builder.CreateAnd(
+        builder.CreateAnd(
+            builder.CreateICmpNE(vertex_count, builder.getInt32(0)),
+            builder.CreateICmpULE(vertex_count, builder.getInt32(warp_vertex_count / 2))
+        ),
+        builder.CreateICmpEQ(builder.CreateURem(vertex_count, builder.getInt32(vertex_per_primitive)), builder.getInt32(0))
+    );
+    auto divisor = builder.CreateSelect(packable, vertex_count, builder.getInt32(warp_vertex_count));
+    auto packed_instance_count = builder.CreateUDiv(builder.getInt32(warp_vertex_count), divisor); // 1 if not packable
+    auto instance_in_warp = builder.CreateUDiv(warp_vertex_id, divisor);
+    auto packed_instance_id =
+        builder.CreateAdd(builder.CreateMul(instance_id, packed_instance_count), instance_in_warp);
+    in_draw_range = builder.CreateSelect(
+        packable,
+        builder.CreateAnd(
+            builder.CreateICmpULT(instance_in_warp, packed_instance_count),
+            builder.CreateICmpULT(packed_instance_id, instance_count)
+        ),
+        builder.CreateICmpULT(global_index_id, vertex_count)
+    );
+    global_index_id = builder.CreateSelect(
+        packable, builder.CreateSub(warp_vertex_id, builder.CreateMul(instance_in_warp, divisor)), global_index_id
+    );
+    instance_id = builder.CreateSelect(packable, packed_instance_id, instance_id);
+    // SV_PrimitiveID restarts with each instance
+    primitive_id_modulus = builder.CreateSelect(
+        packable, builder.CreateUDiv(divisor, builder.getInt32(vertex_per_primitive)), primitive_id_modulus
+    );
+  }
 
   if (is_triadj_strip) {
     // 2nd and 32th vertex are not read but 33th and -2th (or 1st) are.
@@ -727,9 +946,9 @@ convert_dxbc_vertex_for_geometry_shader(
   // explicit initialization
   air.CreateAtomicRMW(llvm::AtomicRMWInst::BinOp::And, valid_vertex_mask, builder.getInt32(0));
 
-  builder.CreateCondBr(
-      builder.CreateICmp(llvm::CmpInst::ICMP_ULT, global_index_id, vertex_count), index_check, will_dispatch
-  );
+  if (!in_draw_range)
+    in_draw_range = builder.CreateICmp(llvm::CmpInst::ICMP_ULT, global_index_id, vertex_count);
+  builder.CreateCondBr(in_draw_range, index_check, will_dispatch);
   builder.SetInsertPoint(index_check);
 
   if (is_dyanmic_ib) {
@@ -930,9 +1149,20 @@ convert_dxbc_vertex_for_geometry_shader(
 
   builder.CreateStore(valid_primitive_mask, builder.CreateConstInBoundsGEP1_32(types._int, payload, 1));
 
-  builder.CreateStore(warp_id, builder.CreateConstInBoundsGEP1_32(types._int, payload, 2));
+  // base and modulus of SV_PrimitiveID
+  builder.CreateStore(
+      builder.CreateMul(warp_id, builder.getInt32(warp_primitive_count)),
+      builder.CreateConstInBoundsGEP1_32(types._int, payload, 2)
+  );
+  builder.CreateStore(primitive_id_modulus, builder.CreateConstInBoundsGEP1_32(types._int, payload, 3));
 
-  air.CreateSetMeshProperties(air.getInt3(warp_primitive_count, pGeometryStage->gs_instance_count, 1));
+  // each mesh threadgroup runs `mesh_threads` GS invocations; none at all if the warp has no complete primitive
+  auto mesh_threads = gs_mesh_threads(pGeometryStage, is_strip);
+  air.CreateSetMeshProperties(builder.CreateSelect(
+      builder.CreateICmpNE(valid_primitive_mask, builder.getInt32(0)),
+      air.getInt3((warp_primitive_count + mesh_threads - 1) / mesh_threads, pGeometryStage->gs_instance_count, 1),
+      air.getInt3(0, 0, 0)
+  ));
 
   builder.CreateBr(return_);
 

@@ -5,7 +5,7 @@
 #ifndef __AIRCONV_H
 #define __AIRCONV_H
 
-#define AIRCONV_VERSION 26
+#define AIRCONV_VERSION 27
 
 #ifdef __cplusplus
 #include <string>
@@ -88,7 +88,43 @@ struct MTL_GEOMETRY_SHADER_REFLECTION {
     uint32_t GSPassThrough;
   };
   uint32_t Primitive;
+  /* threads per mesh threadgroup (= GS invocations batched in one mesh), for list and strip topologies */
+  uint8_t MeshThreadsList;
+  uint8_t MeshThreadsStrip;
+  uint8_t VerticesPerPrimitive;
+  uint8_t Reserved;
 };
+
+/*
+ * Geometry shader emulation layout: shared by the converter (object/mesh shaders),
+ * the pipeline and the draw encoder. They must agree.
+ */
+
+/* object payload: 4 header words, then one float4 per vertex output register for up to 32 vertices */
+static inline uint32_t SM50GSPayloadSize(uint32_t NumVertexOutputElement) {
+  uint32_t size = 16 + 32 * 16 * NumVertexOutputElement;
+  return size < 16256 ? size : 16256;
+}
+
+/*
+ * GS invocations (threads) per mesh threadgroup. Metal allows 256 vertices per mesh;
+ * each invocation owns MaxVertexCount vertices plus one scratch vertex.
+ */
+static inline uint32_t SM50GSMeshThreads(uint32_t PrimitivesPerWarp, uint32_t MaxVertexCount) {
+  uint32_t n = 256 / (MaxVertexCount + 1);
+  return n < 1 ? 1 : n > PrimitivesPerWarp ? PrimitivesPerWarp : n;
+}
+
+/*
+ * Instances packed in one object threadgroup (1 = one warp per instance, no packing).
+ * Small instanced draws of list topologies only: PackUnit is the vertex count of an input
+ * primitive, 0 for strips.
+ */
+static inline uint32_t SM50GSInstancesPerWarp(uint32_t VertexCount, uint32_t VerticesPerWarp, uint32_t PackUnit) {
+  if (!PackUnit || !VertexCount || VertexCount > VerticesPerWarp / 2 || VertexCount % PackUnit)
+    return 1;
+  return VerticesPerWarp / VertexCount;
+}
 
 struct MTL_POST_TESSELLATOR_REFLECTION {
   uint32_t MaxPotentialTessFactor;

@@ -439,6 +439,13 @@ void setup_immediate_constant_buffer(
   air::AirType &types, llvm::Module &module, llvm::IRBuilder<> &builder
 );
 
+/* (vertices, primitives) of a warp, vertices per primitive */
+std::tuple<uint32_t, uint32_t, uint32_t>
+get_vertex_primitive_count_in_warp(microsoft::D3D10_SB_PRIMITIVE primitive, bool strip);
+
+/* GS invocations (threads) per mesh threadgroup, see SM50GSMeshThreads() */
+uint32_t gs_mesh_threads(const SM50ShaderInternal *pGeometryStage, bool strip);
+
 llvm::Error convert_dxbc_geometry_shader(
   SM50ShaderInternal *pShaderInternal, const char *name,
   SM50ShaderInternal *pVertexStage, llvm::LLVMContext &context,

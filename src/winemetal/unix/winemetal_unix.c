@@ -1092,7 +1092,7 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
       [encoder setObjectBufferOffset:body->draw_arguments_offset atIndex:SM50_BINDING_INDEX_DRAW_ARGUMENTS];
       [encoder drawMeshThreadgroups:MTLSizeMake(body->warp_count, body->instance_count, 1)
           threadsPerObjectThreadgroup:MTLSizeMake(body->vertex_per_warp, 1, 1)
-            threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
+            threadsPerMeshThreadgroup:MTLSizeMake(body->mesh_threads, 1, 1)];
       break;
     }
     case WMTRenderCommandDXMTGeometryDrawIndexed: {
@@ -1103,7 +1103,7 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
       [encoder setObjectBufferOffset:body->draw_arguments_offset atIndex:SM50_BINDING_INDEX_DRAW_ARGUMENTS];
       [encoder drawMeshThreadgroups:MTLSizeMake(body->warp_count, body->instance_count, 1)
           threadsPerObjectThreadgroup:MTLSizeMake(body->vertex_per_warp, 1, 1)
-            threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
+            threadsPerMeshThreadgroup:MTLSizeMake(body->mesh_threads, 1, 1)];
       break;
     }
     case WMTRenderCommandDXMTGeometryDrawIndirect: {
@@ -1114,7 +1114,7 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
       [encoder drawMeshThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)body->dispatch_args_buffer
                                  indirectBufferOffset:body->dispatch_args_offset
                           threadsPerObjectThreadgroup:MTLSizeMake(body->vertex_per_warp, 1, 1)
-                            threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
+                            threadsPerMeshThreadgroup:MTLSizeMake(body->mesh_threads, 1, 1)];
       [encoder setObjectBuffer:(id<MTLBuffer>)body->imm_draw_arguments
                         offset:0
                        atIndex:SM50_BINDING_INDEX_DRAW_ARGUMENTS];
@@ -1132,7 +1132,7 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
       [encoder drawMeshThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)body->dispatch_args_buffer
                                  indirectBufferOffset:body->dispatch_args_offset
                           threadsPerObjectThreadgroup:MTLSizeMake(body->vertex_per_warp, 1, 1)
-                            threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
+                            threadsPerMeshThreadgroup:MTLSizeMake(body->mesh_threads, 1, 1)];
       [encoder setObjectBuffer:(id<MTLBuffer>)body->imm_draw_arguments
                         offset:0
                        atIndex:SM50_BINDING_INDEX_DRAW_ARGUMENTS];
