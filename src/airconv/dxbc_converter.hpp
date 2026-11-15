@@ -443,8 +443,8 @@ void setup_immediate_constant_buffer(
 std::tuple<uint32_t, uint32_t, uint32_t>
 get_vertex_primitive_count_in_warp(microsoft::D3D10_SB_PRIMITIVE primitive, bool strip);
 
-/* GS invocations (threads) per mesh threadgroup, see SM50GSMeshThreads() */
-uint32_t gs_mesh_threads(const SM50ShaderInternal *pGeometryStage, bool strip);
+/* GS invocations (threads) a mesh threadgroup can hold, see SM50GSMeshThreadsLimit() */
+uint32_t gs_mesh_threads_limit(const SM50ShaderInternal *pGeometryStage);
 
 llvm::Error convert_dxbc_geometry_shader(
   SM50ShaderInternal *pShaderInternal, const char *name,

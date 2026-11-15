@@ -6,15 +6,16 @@ import Foundation
 let a = CommandLine.arguments
 let workload = a[1], mode = Int(a[2])!, payloadWords = Int(a[3])!, pack = Int(a[4])!
 let frames = a.count > 5 ? Int(a[5])! : 12
+let warpV = a.count > 6 ? Int(a[6])! : 30   // expérience : sommets par warp (30 = DXMT)
 let dev = MTLCreateSystemDefaultDevice()!
 let q = dev.makeCommandQueue()!
 let src = try! String(contentsOfFile: (a[0] as NSString).deletingLastPathComponent + "/gs.metal")
 
 func pipeline(nreg: Int) -> MTLRenderPipelineState {
   let o = MTLCompileOptions()
-  let payloadWords = payloadWords == 0 ? 4 + 30 * nreg * 4 + 4 : payloadWords   // 0 = au plus juste
+  let payloadWords = payloadWords == 0 ? 4 + warpV * nreg * 4 + 4 : payloadWords   // 0 = au plus juste
   o.preprocessorMacros = ["PAYLOAD_WORDS": NSNumber(value: payloadWords), "MESH_MODE": NSNumber(value: mode),
-                          "PACK": NSNumber(value: pack), "NREG": NSNumber(value: nreg)]
+                          "PACK": NSNumber(value: pack), "NREG": NSNumber(value: nreg), "WARP_V": NSNumber(value: warpV)]
   o.languageVersion = .version3_2
   let lib = try! dev.makeLibrary(source: src, options: o)
   let d = MTLMeshRenderPipelineDescriptor()
@@ -22,8 +23,8 @@ func pipeline(nreg: Int) -> MTLRenderPipelineState {
   d.meshFunction = lib.makeFunction(name: "meshfn")
   d.fragmentFunction = lib.makeFunction(name: "frag")
   d.payloadMemoryLength = payloadWords * 4
-  d.maxTotalThreadsPerObjectThreadgroup = 30
-  d.maxTotalThreadsPerMeshThreadgroup = mode >= 2 ? 10 : 1
+  d.maxTotalThreadsPerObjectThreadgroup = warpV
+  d.maxTotalThreadsPerMeshThreadgroup = mode >= 2 ? warpV / 3 : 1
   d.depthAttachmentPixelFormat = .depth32Float
   return try! dev.makeRenderPipelineState(descriptor: d, options: []).0
 }
@@ -62,7 +63,7 @@ for i in 0..<drawsB { args.append(DrawArgs(indexCount: 6, instanceCount: UInt32(
 func buf<T>(_ x: [T]) -> MTLBuffer { x.withUnsafeBytes { dev.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared)! } }
 let bVA = buf(vbA), bIA = buf(ibA), bVB = buf(vbB), bIB = buf(ibB), bInst = buf(inst), bCasc = buf(casc), bUni = buf(uni), bArgs = buf(args)
 let psoA = pipeline(nreg: 1), psoB = pipeline(nreg: 2)
-let meshThreads = MTLSize(width: mode >= 2 ? 10 : 1, height: 1, depth: 1)
+let meshThreads = MTLSize(width: mode >= 2 ? warpV / 3 : 1, height: 1, depth: 1)
 let stride = MemoryLayout<DrawArgs>.stride
 
 func frame() -> Double {
@@ -80,7 +81,7 @@ func frame() -> Double {
     e.setObjectBuffer(bIA, offset: 0, index: 0); e.setObjectBuffer(bVA, offset: 0, index: 1)
     for i in 0..<drawsA {
       e.setObjectBufferOffset(i * stride, index: 2)
-      e.drawMeshThreadgroups(MTLSize(width: (trisA * 3 - 1) / 30 + 1, height: 1, depth: 1),
+      e.drawMeshThreadgroups(MTLSize(width: (trisA * 3 - 1) / warpV + 1, height: 1, depth: 1),
                              threadsPerObjectThreadgroup: MTLSize(width: 30, height: 1, depth: 1), threadsPerMeshThreadgroup: meshThreads)
     }
   }
@@ -89,9 +90,10 @@ func frame() -> Double {
     e.setObjectBuffer(bIB, offset: 0, index: 0); e.setObjectBuffer(bVB, offset: 0, index: 1)
     for i in 0..<drawsB {
       e.setObjectBufferOffset((drawsA + i) * stride, index: 2)
-      let groups = pack == 1 ? (instB + 4) / 5 : instB
+      let k = warpV / 6
+      let groups = pack == 1 ? (instB + k - 1) / k : instB
       e.drawMeshThreadgroups(MTLSize(width: 1, height: groups, depth: 1),
-                             threadsPerObjectThreadgroup: MTLSize(width: 30, height: 1, depth: 1), threadsPerMeshThreadgroup: meshThreads)
+                             threadsPerObjectThreadgroup: MTLSize(width: warpV, height: 1, depth: 1), threadsPerMeshThreadgroup: meshThreads)
     }
   }
   e.endEncoding()
