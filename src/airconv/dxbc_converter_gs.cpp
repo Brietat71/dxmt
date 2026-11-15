@@ -102,6 +102,9 @@ gs_mesh_threads_limit(const SM50ShaderInternal *pGeometryStage) {
   // conversion below has only been exercised with DXBC. Batch them when a DXIL GS workload shows up.
   if (pGeometryStage->dxil)
     return 1;
+  // the GS body runs twice (count, then write): only if it has no side effect but its emits
+  if (!pGeometryStage->shader_info.uavMap.empty())
+    return 1;
   return SM50GSMeshThreadsLimit(pGeometryStage->gs_max_vertex_output);
 }
 
