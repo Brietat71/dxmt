@@ -108,6 +108,188 @@ gs_mesh_threads_limit(const SM50ShaderInternal *pGeometryStage) {
   return SM50GSMeshThreadsLimit(pGeometryStage->gs_max_vertex_output);
 }
 
+/*
+ * Payload slot of each vertex of primitive `primitive_id` of the warp: load_vertex(slot, vertex of the primitive)
+ */
+static llvm::Error
+gs_primitive_vertices(
+    llvm::IRBuilder<> &builder, D3D10_SB_PRIMITIVE primitive, bool is_strip, uint32_t vertex_per_primitive,
+    pvalue primitive_id, const std::function<void(pvalue, uint32_t)> &load_vertex
+) {
+  auto const one_const = builder.getInt32(1);
+  auto const two_const = builder.getInt32(2);
+  if (is_strip && primitive != D3D10_SB_PRIMITIVE_POINT) {
+    auto leading_vertex_index = primitive_id;
+    switch (primitive) {
+    case microsoft::D3D10_SB_PRIMITIVE_TRIANGLE: {
+      /*
+      primitive 0: {0, 1, 2}
+      primitive 1: {1, 3, 2}
+      ...
+      primitive n: {n, n + 1 + (n & 1), n + 2 - (n & 1)}
+
+      I know primitive restart can be broken! just assume the 1st triangle of the thunk is at correct winding
+      */
+      auto odd_bit = builder.CreateAnd(leading_vertex_index, builder.getInt32(1));
+      load_vertex(leading_vertex_index, 0);
+      load_vertex(builder.CreateAdd(builder.CreateAdd(leading_vertex_index, builder.getInt32(1)), odd_bit), 1);
+      load_vertex(builder.CreateSub(builder.CreateAdd(leading_vertex_index, builder.getInt32(2)), odd_bit), 2);
+      break;
+    }
+    case microsoft::D3D10_SB_PRIMITIVE_LINE: {
+      /*
+      primitive 0: {0, 1}
+      primitive 1: {1, 2}
+      ...
+      primitive n: {n, n+1}
+      */
+      load_vertex(leading_vertex_index, 0);
+      load_vertex(builder.CreateAdd(leading_vertex_index, builder.getInt32(1)), 1);
+      break;
+    }
+    case microsoft::D3D10_SB_PRIMITIVE_LINE_ADJ: {
+      /*
+      primitive 0: {0, 1, 2, 3}
+      primitive 1: {1, 2, 3, 4}
+      ...
+      primitive n: {n, n+1, n+2, n+3}
+      */
+      load_vertex(leading_vertex_index, 0);
+      load_vertex(builder.CreateAdd(leading_vertex_index, builder.getInt32(1)), 1);
+      load_vertex(builder.CreateAdd(leading_vertex_index, builder.getInt32(2)), 2);
+      load_vertex(builder.CreateAdd(leading_vertex_index, builder.getInt32(3)), 3);
+      break;
+    }
+    case microsoft::D3D10_SB_PRIMITIVE_TRIANGLE_ADJ: {
+      /*
+      assume 16 vertices for 6 primitives:
+      primitive 0: {0, (-2), 2, 6, 4, 3}
+      primitive 1: {2, 5, 6, 8, 4, 0}
+      primitive 2: {4, 2, 6,10, 8, 7}
+      primitive 3: {6, 9,10,12, 8, 4}
+      primitive 4: {8, 6, 10,14,12,11}
+      primitive 5: {10,13,14,(16),12,8}
+      ...
+      primitive n (inter): {2n, -, 2(n + 1 + (n & 1)), -, 2(n + 2 - (n & 1)), -}
+      primitive n (outer1): {-, is_even(n) ? 2n - 2 :2n + 3 : , -, -, -, -} mod 17 (-2 mapped to 15)
+      primitive n (outer2): {-, -, -, 6 + 2n, -, -} mod 15 (16 mapped to 1)
+      primitive n (outer3): {-, -, -, -, -, is_even(n) ? 2n + 3: 2n - 2}
+      */
+      auto double_ = [&](pvalue val) { return builder.CreateMul(two_const, val);};
+      auto odd_bit = builder.CreateAnd(leading_vertex_index, one_const);
+      auto _2n = double_(leading_vertex_index);
+      load_vertex(_2n, 0);
+      load_vertex(double_(builder.CreateAdd(builder.CreateAdd(leading_vertex_index, one_const), odd_bit)), 2);
+      load_vertex(double_(builder.CreateSub(builder.CreateAdd(leading_vertex_index, two_const), odd_bit)), 4);
+      auto _2np3 = builder.CreateAdd(_2n, builder.getInt32(3));
+      auto _2nm2 = builder.CreateSub(_2n, two_const);
+      auto is_odd = builder.CreateICmpEQ(odd_bit, one_const);
+      load_vertex(builder.CreateURem(builder.CreateSelect(is_odd, _2np3, _2nm2), builder.getInt32(33)), 1);
+      load_vertex(builder.CreateURem(builder.CreateAdd(_2n, builder.getInt32(6)), builder.getInt32(31)), 3);
+      load_vertex(builder.CreateSelect(is_odd, _2nm2, _2np3), 5);
+      break;
+    }
+    default:
+      return llvm::make_error<UnsupportedFeature>(std::format(
+          "unhandled geometry shader input primitive strip: {}", (uint32_t)primitive
+      ));
+    }
+  } else {
+    auto leading_vertex_index = builder.CreateMul(builder.getInt32(vertex_per_primitive), primitive_id);
+    for (uint32_t vid = 0; vid < vertex_per_primitive; vid++) {
+      load_vertex(builder.CreateAdd(leading_vertex_index, builder.getInt32(vid)), vid);
+    }
+  }
+  return llvm::Error::success();
+}
+
+/*
+ * What a GS invocation has emitted so far: D3D strips turned into the vertices and primitives of a mesh.
+ * Vertices of the current strip are provisional until the strip is cut with enough of them.
+ */
+struct GSEmitCounters {
+  llvm::IRBuilder<> &builder;
+  llvm::Type *int_ty;
+  air::MeshOutputTopology topology;
+  uint32_t max_vertex_out;
+  bool limit; // a slice holds max_vertex_out vertices: as D3D does, ignore what is emitted past it
+  llvm::AllocaInst *next_write_vertex; // vertex of the current strip (of the invocation for points)
+  llvm::AllocaInst *vertex_offset;     // first vertex of the current strip
+  llvm::AllocaInst *primitive_count;
+  llvm::AllocaInst *emitted_vertices = nullptr;
+  pvalue accepted = nullptr; // `limit` only: the emit being converted is within max_vertex_out
+
+  GSEmitCounters(
+      llvm::IRBuilder<> &builder, llvm::Type *int_ty, air::MeshOutputTopology topology, uint32_t max_vertex_out,
+      bool limit
+  ) : builder(builder), int_ty(int_ty), topology(topology), max_vertex_out(max_vertex_out), limit(limit) {
+    next_write_vertex = builder.CreateAlloca(int_ty, nullptr, "next_write_vertex");
+    vertex_offset = builder.CreateAlloca(int_ty, nullptr, "vertex_offset");
+    primitive_count = builder.CreateAlloca(int_ty, nullptr, "primitive_count");
+    if (limit)
+      emitted_vertices = builder.CreateAlloca(int_ty, nullptr, "emitted_vertices");
+    reset(builder.getInt32(0), builder.getInt32(0));
+  }
+
+  void
+  reset(pvalue first_vertex, pvalue first_primitive) {
+    builder.CreateStore(builder.getInt32(0), next_write_vertex);
+    builder.CreateStore(first_vertex, vertex_offset);
+    builder.CreateStore(first_primitive, primitive_count);
+    if (limit)
+      builder.CreateStore(builder.getInt32(0), emitted_vertices);
+  }
+
+  /* Returns the increment of the vertex counters for this emit */
+  pvalue
+  begin_emit() {
+    if (!limit)
+      return builder.getInt32(1);
+    auto emitted = builder.CreateLoad(int_ty, emitted_vertices);
+    accepted = builder.CreateICmpULT(emitted, builder.getInt32(max_vertex_out));
+    auto increment = builder.CreateZExt(accepted, int_ty);
+    builder.CreateStore(builder.CreateAdd(emitted, increment), emitted_vertices);
+    return increment;
+  }
+
+  /* An emit that only counts */
+  void
+  count_emit() {
+    auto current_write_vertex = builder.CreateLoad(int_ty, next_write_vertex);
+    builder.CreateStore(builder.CreateAdd(begin_emit(), current_write_vertex), next_write_vertex);
+  }
+
+  void
+  cut() {
+    if (topology == air::MeshOutputTopology::Point)
+      return; // there is nothing to cut!
+    // a strip needs 3 vertices (2 for lines) to count
+    const uint32_t first_primitive_at = topology == air::MeshOutputTopology::Triangle ? 2 : 1;
+    auto const zero_const = builder.getInt32(0);
+    auto current_write_vertex = builder.CreateLoad(int_ty, next_write_vertex);
+    builder.CreateStore(zero_const, next_write_vertex);
+
+    auto has_valid_primitive = builder.CreateICmpUGT(current_write_vertex, builder.getInt32(first_primitive_at));
+    auto add_primitive_count = builder.CreateSelect(
+        has_valid_primitive, builder.CreateSub(current_write_vertex, builder.getInt32(first_primitive_at)), zero_const
+    );
+    auto add_vertex_count = builder.CreateSelect(has_valid_primitive, current_write_vertex, zero_const);
+    builder.CreateStore(builder.CreateAdd(builder.CreateLoad(int_ty, vertex_offset), add_vertex_count), vertex_offset);
+    builder.CreateStore(
+        builder.CreateAdd(builder.CreateLoad(int_ty, primitive_count), add_primitive_count), primitive_count
+    );
+  }
+
+  /* vertices | primitives << 16, once the last strip is cut */
+  pvalue
+  emitted() {
+    auto vertices = builder.CreateLoad(int_ty, topology == air::MeshOutputTopology::Point ? next_write_vertex : vertex_offset);
+    auto primitives =
+        topology == air::MeshOutputTopology::Point ? vertices : builder.CreateLoad(int_ty, primitive_count);
+    return builder.CreateOr(vertices, builder.CreateShl(primitives, 16));
+  }
+};
+
 struct GSWarpLayout {
   uint32_t vertex_count;         // threads of the object threadgroup
   uint32_t primitive_count;
@@ -261,12 +443,9 @@ convert_dxbc_geometry_shader(
   auto const zero_const = builder.getInt32(0);
   auto const one_const = builder.getInt32(1);
   auto const two_const = builder.getInt32(2);
-  auto next_write_vertex = builder.CreateAlloca(types._int, nullptr, "next_write_vertex");
-  builder.CreateStore(zero_const, next_write_vertex);
-  auto vertex_offset = builder.CreateAlloca(types._int, nullptr, "vertex_offset");
-  builder.CreateStore(zero_const, vertex_offset);
-  auto primitive_count = builder.CreateAlloca(types._int, nullptr, "primitive_count");
-  builder.CreateStore(zero_const, primitive_count);
+  GSEmitCounters counters(builder, types._int, topology, max_vertex_out, batched);
+  auto next_write_vertex = counters.next_write_vertex, vertex_offset = counters.vertex_offset,
+       primitive_count = counters.primitive_count;
 
   auto mesh_ptr = function->getArg(mesh_idx);
 
@@ -290,25 +469,7 @@ convert_dxbc_geometry_shader(
   bool count_only = false; // converting the counting pass: emit/cut only maintain the counters
   pvalue end_vertex = nullptr, end_primitive = nullptr; // end of the thread's slice of the mesh
   pvalue scratch_vertex = nullptr, scratch_primitive = nullptr;
-  llvm::AllocaInst *emitted_vertices = nullptr;
-  if (batched) {
-    emitted_vertices = builder.CreateAlloca(types._int, nullptr, "emitted_vertices");
-    builder.CreateStore(zero_const, emitted_vertices);
-  }
-  pvalue emit_accepted = nullptr;
-  /*
-   * Returns the increment of the vertex counters for this emit. A slice holds maxvertexcount
-   * vertices: as D3D does, ignore what the GS emits past it.
-   */
-  auto begin_emit = [&]() -> pvalue {
-    if (!batched)
-      return one_const;
-    auto emitted = builder.CreateLoad(types._int, emitted_vertices);
-    emit_accepted = builder.CreateICmpULT(emitted, builder.getInt32(max_vertex_out));
-    auto increment = builder.CreateZExt(emit_accepted, types._int);
-    builder.CreateStore(builder.CreateAdd(emitted, increment), emitted_vertices);
-    return increment;
-  };
+  auto begin_emit = [&]() { return counters.begin_emit(); };
   /*
    * A vertex is written before its strip is known to be valid, and so is the primitive it leads.
    * Within the slice, such a write is overwritten by the next valid strip; past its end it would
@@ -316,14 +477,14 @@ convert_dxbc_geometry_shader(
    */
   auto vertex_slot = [&](pvalue vertex) {
     return batched ? builder.CreateSelect(
-                         builder.CreateAnd(emit_accepted, builder.CreateICmpULT(vertex, end_vertex)), vertex,
+                         builder.CreateAnd(counters.accepted, builder.CreateICmpULT(vertex, end_vertex)), vertex,
                          scratch_vertex
                      )
                    : vertex;
   };
   auto primitive_slot = [&](pvalue primitive) {
     return batched ? builder.CreateSelect(
-                         builder.CreateAnd(emit_accepted, builder.CreateICmpULT(primitive, end_primitive)), primitive,
+                         builder.CreateAnd(counters.accepted, builder.CreateICmpULT(primitive, end_primitive)), primitive,
                          scratch_primitive
                      )
                    : primitive;
@@ -365,22 +526,6 @@ convert_dxbc_geometry_shader(
           builder.CreateAdd(builder.CreateAdd(current_vertex_with_offset, one_const), even_winding)
       );
     };
-    resource_map.call_cut = [&]() {
-      auto current_write_vertex = builder.CreateLoad(types._int, next_write_vertex);
-      builder.CreateStore(zero_const, next_write_vertex);
-
-      auto has_valid_primitive = builder.CreateICmpUGT(current_write_vertex, builder.getInt32(2));
-      auto add_primitive_count = builder.CreateSelect(
-          has_valid_primitive, builder.CreateSub(current_write_vertex, builder.getInt32(2)), zero_const
-      );
-      auto add_vertex_count = builder.CreateSelect(has_valid_primitive, current_write_vertex, zero_const);
-      builder.CreateStore(
-          builder.CreateAdd(builder.CreateLoad(types._int, vertex_offset), add_vertex_count), vertex_offset
-      );
-      builder.CreateStore(
-          builder.CreateAdd(builder.CreateLoad(types._int, primitive_count), add_primitive_count), primitive_count
-      );
-    };
   } else if (topology == air::MeshOutputTopology::Line) {
     resource_map.call_emit = [&]() {
       auto current_write_vertex = builder.CreateLoad(types._int, next_write_vertex);
@@ -410,22 +555,6 @@ convert_dxbc_geometry_shader(
           builder.CreateAdd(current_vertex_with_offset, one_const)
       );
     };
-    resource_map.call_cut = [&]() {
-      auto current_write_vertex = builder.CreateLoad(types._int, next_write_vertex);
-      builder.CreateStore(zero_const, next_write_vertex);
-
-      auto has_valid_primitive = builder.CreateICmpUGT(current_write_vertex, builder.getInt32(1));
-      auto add_primitive_count = builder.CreateSelect(
-          has_valid_primitive, builder.CreateSub(current_write_vertex, builder.getInt32(1)), zero_const
-      );
-      auto add_vertex_count = builder.CreateSelect(has_valid_primitive, current_write_vertex, zero_const);
-      builder.CreateStore(
-          builder.CreateAdd(builder.CreateLoad(types._int, vertex_offset), add_vertex_count), vertex_offset
-      );
-      builder.CreateStore(
-          builder.CreateAdd(builder.CreateLoad(types._int, primitive_count), add_primitive_count), primitive_count
-      );
-    };
   } else {
     resource_map.call_emit = [&]() {
       // only one accumulator to maintain, simple one ~
@@ -444,10 +573,8 @@ convert_dxbc_geometry_shader(
       air.CreateSetMeshPointSize(current_point, air.getFloat(1.0));
       air.CreateSetMeshIndex(current_point, current_point);
     };
-    resource_map.call_cut = []() {
-      // there is nothing to cut!
-    };
   }
+  resource_map.call_cut = [&]() { counters.cut(); };
 
   // payload: (primitive id base, primitive id modulus, -, -), a validity word per vertex, the vertices
   auto payload = function->getArg(payload_idx);
@@ -509,87 +636,10 @@ convert_dxbc_geometry_shader(
     );
   };
 
-  if (is_strip && pShaderInternal->gs_input_primitive != D3D10_SB_PRIMITIVE_POINT) {
-    auto leading_vertex_index = primitive_id_in_warp;
-    switch (pShaderInternal->gs_input_primitive) {
-    case microsoft::D3D10_SB_PRIMITIVE_TRIANGLE: {
-      /*
-      primitive 0: {0, 1, 2}
-      primitive 1: {1, 3, 2}
-      ...
-      primitive n: {n, n + 1 + (n & 1), n + 2 - (n & 1)}
-
-      I know primitive restart can be broken! just assume the 1st triangle of the thunk is at correct winding
-      */
-      auto odd_bit = builder.CreateAnd(leading_vertex_index, builder.getInt32(1));
-      load_vertex(leading_vertex_index, 0);
-      load_vertex(builder.CreateAdd(builder.CreateAdd(leading_vertex_index, builder.getInt32(1)), odd_bit), 1);
-      load_vertex(builder.CreateSub(builder.CreateAdd(leading_vertex_index, builder.getInt32(2)), odd_bit), 2);
-      break;
-    }
-    case microsoft::D3D10_SB_PRIMITIVE_LINE: {
-      /*
-      primitive 0: {0, 1}
-      primitive 1: {1, 2}
-      ...
-      primitive n: {n, n+1}
-      */
-      load_vertex(leading_vertex_index, 0);
-      load_vertex(builder.CreateAdd(leading_vertex_index, builder.getInt32(1)), 1);
-      break;
-    }
-    case microsoft::D3D10_SB_PRIMITIVE_LINE_ADJ: {
-      /*
-      primitive 0: {0, 1, 2, 3}
-      primitive 1: {1, 2, 3, 4}
-      ...
-      primitive n: {n, n+1, n+2, n+3}
-      */
-      load_vertex(leading_vertex_index, 0);
-      load_vertex(builder.CreateAdd(leading_vertex_index, builder.getInt32(1)), 1);
-      load_vertex(builder.CreateAdd(leading_vertex_index, builder.getInt32(2)), 2);
-      load_vertex(builder.CreateAdd(leading_vertex_index, builder.getInt32(3)), 3);
-      break;
-    }
-    case microsoft::D3D10_SB_PRIMITIVE_TRIANGLE_ADJ: {
-      /*
-      assume 16 vertices for 6 primitives:
-      primitive 0: {0, (-2), 2, 6, 4, 3}
-      primitive 1: {2, 5, 6, 8, 4, 0}
-      primitive 2: {4, 2, 6,10, 8, 7}
-      primitive 3: {6, 9,10,12, 8, 4}
-      primitive 4: {8, 6, 10,14,12,11}
-      primitive 5: {10,13,14,(16),12,8}
-      ...
-      primitive n (inter): {2n, -, 2(n + 1 + (n & 1)), -, 2(n + 2 - (n & 1)), -}
-      primitive n (outer1): {-, is_even(n) ? 2n - 2 :2n + 3 : , -, -, -, -} mod 17 (-2 mapped to 15)
-      primitive n (outer2): {-, -, -, 6 + 2n, -, -} mod 15 (16 mapped to 1)
-      primitive n (outer3): {-, -, -, -, -, is_even(n) ? 2n + 3: 2n - 2}
-      */
-      auto double_ = [&](pvalue val) { return builder.CreateMul(two_const, val);};
-      auto odd_bit = builder.CreateAnd(leading_vertex_index, one_const);
-      auto _2n = double_(leading_vertex_index);
-      load_vertex(_2n, 0);
-      load_vertex(double_(builder.CreateAdd(builder.CreateAdd(leading_vertex_index, one_const), odd_bit)), 2);
-      load_vertex(double_(builder.CreateSub(builder.CreateAdd(leading_vertex_index, two_const), odd_bit)), 4);
-      auto _2np3 = builder.CreateAdd(_2n, builder.getInt32(3));
-      auto _2nm2 = builder.CreateSub(_2n, two_const);
-      auto is_odd = builder.CreateICmpEQ(odd_bit, one_const);
-      load_vertex(builder.CreateURem(builder.CreateSelect(is_odd, _2np3, _2nm2), builder.getInt32(33)), 1);
-      load_vertex(builder.CreateURem(builder.CreateAdd(_2n, builder.getInt32(6)), builder.getInt32(31)), 3);
-      load_vertex(builder.CreateSelect(is_odd, _2nm2, _2np3), 5);
-      break;
-    }
-    default:
-      return llvm::make_error<UnsupportedFeature>(std::format(
-          "unhandled geometry shader input primitive strip: {}", (uint32_t)pShaderInternal->gs_input_primitive
-      ));
-    }
-  } else {
-    auto leading_vertex_index = builder.CreateMul(builder.getInt32(vertex_per_primitive), primitive_id_in_warp);
-    for (uint32_t vid = 0; vid < vertex_per_primitive; vid++) {
-      load_vertex(builder.CreateAdd(leading_vertex_index, builder.getInt32(vid)), vid);
-    }
+  if (auto err = gs_primitive_vertices(
+          builder, pShaderInternal->gs_input_primitive, is_strip, vertex_per_primitive, primitive_id_in_warp, load_vertex
+      )) {
+    return err;
   }
 
   auto assemble_exit_bb = builder.GetInsertBlock();
@@ -655,14 +705,9 @@ convert_dxbc_geometry_shader(
     builder.CreateBr(count_entry.get());
 
     builder.SetInsertPoint(count_end_bb);
-    resource_map.call_cut();
-    auto vertex_emitted =
-        builder.CreateLoad(types._int, topology == air::MeshOutputTopology::Point ? next_write_vertex : vertex_offset);
-    auto primitive_emitted = topology == air::MeshOutputTopology::Point
-                                 ? vertex_emitted
-                                 : builder.CreateLoad(types._int, primitive_count);
+    counters.cut();
     // at most maxvertexcount vertices (see begin_emit), so at most max_primitive_out primitives: it fits the slice
-    auto emitted = builder.CreateOr(vertex_emitted, builder.CreateShl(primitive_emitted, 16));
+    auto emitted = counters.emitted();
     auto count_exit_bb = builder.GetInsertBlock();
     builder.CreateBr(sync_bb);
 
@@ -706,10 +751,7 @@ convert_dxbc_geometry_shader(
     end_primitive = builder.CreateAdd(first_primitive, builder.CreateLShr(own_count, 16));
     scratch_vertex = builder.CreateAdd(thread_id, builder.getInt32(scratch_vertex_base));
     scratch_primitive = builder.CreateAdd(thread_id, builder.getInt32(scratch_primitive_base));
-    builder.CreateStore(zero_const, next_write_vertex);
-    builder.CreateStore(zero_const, emitted_vertices);
-    builder.CreateStore(first_vertex, vertex_offset);
-    builder.CreateStore(first_primitive, primitive_count);
+    counters.reset(first_vertex, first_primitive);
   }
 
   auto real_entry = convert_body(epilogue_bb);
