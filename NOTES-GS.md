@@ -306,6 +306,40 @@ pour une petite passe plein écran sur une autre texture, puis revient au G-buff
 DXMT ne peut fusionner 70 et 72 que si 71 peut passer avant ou après les deux, donc s'il ne lit pas le G-buffer et n'est pas lu par la suite.
 À vérifier en jeu (quelles textures lit le n° 71) avant d'espérer quoi que ce soit ; le gain serait un stockage et un rechargement de 4 attachements.
 
+### Session `d1` : vue dense fixe sur la bouteille Rosetta, profil max, build sonde `54fd47a3` (22:03-22:07, verrou 229 s)
+
+Charge machine pendant la mesure : WARNO 383 % CPU, WindowServer 5,5 %, rien d'autre au-dessus de 5 %.
+
+| Scène | FPS | GPU ms | Reste |
+|---|---|---|---|
+| Déploiement | 61,4 | 16,4 | |
+| **Vue dense fixe** | **45,4** (45,48 / 45,31) | **24,2** | ioreg Device 99 %, Renderer 99 % ; thread principal 73-75 %, suivants 24 % et 20 % |
+
+Identique à l'arm64 (45,3 fps, 24,4 ms) : dans cette vue, les deux piles sont limitées par le GPU.
+
+**Charge GS par image dans la vue dense** (`probe2/stats.txt`, fenêtres de 10 s, 45 fps, ~6 000 draws par image dont ~2 400 par GS) :
+
+| VS + GS | draws | indices | instances/draw | object TG (= mesh TG) |
+|---|---|---|---|---|
+| `ee4035d1` + `e9bce06f` billboards | 187 | 5,6 M | ~5 000 | **93,7 k** |
+| `75b4cf05` + `49993012` triangles indexés | 1 315 | 2,35 M | 1 | 39,7 k |
+| `6cb6fd2a` + `73747483` non indexé | 112 | 2,17 M | 1 | 36,2 k |
+| `48f7d6ef` + `ed6937b1` non indexé (nouvelle paire) | 39 | 1,36 M | 1 | 22,7 k |
+| `5e6a21a3` + `ce4706da` | 152-191 | 0,67-1,25 M | 1 | 11-21 k |
+| 9 autres paires | ~600 | ~1,8 M | 1 à 21 | ~33 k |
+| **Total** | ~2 400 | **~16,5 M (5,5 M triangles)** | | **~250 k** |
+
+- 3,8 à 4,0 ms de Vertex pour 250 k paires object + mesh = **16 ns par paire** : c'est le coût fixe mesuré au banc (mesh ~13 ns, object 3 à 6 ns).
+- Les volumes sont presque ceux du déploiement (billboards 0,94 M de quads contre 1,17 M) : **le jeu envoie toute la carte dans la passe d'ombre à chaque image**
+  et laisse le GS éliminer ce qui est hors des cascades. De près, les cascades sont serrées : la plupart des warps n'émettent rien,
+  mais chacun paie quand même son mesh threadgroup.
+
+**GPU hang : ce n'est pas le chemin GS.** `probe2/errors-encoders.txt`, première image de la carte (frame 949) :
+l'encodeur **fautif** est **`R 1c0d 16x16x6 cL/S`**, une passe sur une cible 16×16 à 6 couches (cube), suivie de cinq autres
+(`16x16x5` … `16x16x1`) ; la passe `GS 0c1d 2048x2048x4` et le reste du tampon sont seulement « affectés ». Ces passes cube n'existent qu'au chargement d'une scène,
+d'où une erreur à la première image du menu et une à la première image de la carte. Deux autres tampons de la session sont des « victimes innocentes » (frames 288 et 3273).
+Suite : identifier les shaders de cette passe 16×16×6 (boucle dont la borne vient d'une ressource pas encore initialisée ? même famille que le bug des imposteurs).
+
 ### Où part la géométrie des GS maintenant (banc aux vrais shaders, expériences jetées, GPU au repos)
 
 | Mesure (rastérisation coupée) | A : triangles indexés | B : billboards |
@@ -318,7 +352,10 @@ DXMT ne peut fusionner 70 et 72 que si 71 peut passer avant ou après les deux, 
   pas le travail du GS : sauter tout le corps du GS ne change rien. L'étage object (les VS) pèse 15 à 30 %.
 - Sans effet mesuré : les barrières (banc synthétique, avec ou sans), le nombre de primitives déclaré (160 → 80), un fragment shader vide ou absent.
 - Le nombre d'invocations par mesh threadgroup est borné par la limite Metal de 256 sommets par mesh : 25 au plus pour `maxvertexcount = 9`, 20 aujourd'hui.
-- Conclusion : la géométrie des GS est à ~20 % d'un pipeline vertex natif. Il n'y a plus de facteur 2 à y prendre.
+- Taille du payload (banc synthétique, sans émission) : aucun effet jusqu'à ~3 Ko (0,98 ms à 1 000, 2 000 et 3 200 o ; 1,11 à 4 800 ; 1,55 à 8 000 ; 2,8 à 16 256).
+  Les payloads actuels (1 296 à 3 344 o) sont dans la zone plate.
+- Conclusion : à nombre de mesh threadgroups donné, la géométrie des GS est à ~20 % d'un pipeline vertex natif.
+  Le levier restant est d'en lancer moins : **ne pas lancer de mesh threadgroup pour un warp dont le GS n'émet rien** (voir « comptage dans l'étage object »).
 
 ### Piste « routage par cascade en pipeline vertex » : évaluée, écartée
 
