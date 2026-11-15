@@ -117,6 +117,7 @@ public:
     attached_cmdbuf = cmdbuf;
     auto t1 = clock::now();
     readback = enc.flushCommands(cmdbuf, chunk_id, chunk_event_id);
+    enc.releaseDeferred(); /* neutron: replaced bindings, see ArgumentEncodingContext::deferRelease */
     auto t2 = clock::now();
     statistics.encode_prepare_interval += (t1 - t0);
     statistics.encode_flush_interval += (t2 - t1);
