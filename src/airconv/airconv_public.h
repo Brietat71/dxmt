@@ -114,6 +114,8 @@ static inline uint32_t SM50GSWarpScale(uint32_t NumVertexOutputElement, uint32_t
  */
 static inline uint32_t SM50GSPayloadSize(uint32_t NumVertexOutputElement, uint32_t WarpScale) {
   uint32_t size = 16 + 32 * WarpScale * (4 + 16 * NumVertexOutputElement);
+  // ponytail: as before, a VS with 32 output registers does not fit (16528 bytes) and overruns the
+  // payload. Shrink its warp if such a shader ever feeds a GS.
   return size < 16256 ? size : 16256;
 }
 
