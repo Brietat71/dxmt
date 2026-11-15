@@ -221,7 +221,12 @@ Les deux `Caused GPU Hang Error` reviennent à chaque lancement (première frame
 Avec la variable, le journal reçoit sous l'erreur l'état de chaque encodeur du tampon (`dxmt:   FAULTED   GS 0c1d 2048x2048x4 …`) :
 il suffit de recopier ces lignes. Contre-épreuve utile : le même chargement en Élevé avec le runtime `fork` (ancien chemin GS) donne-t-il aussi les deux erreurs ?
 
-Le reste (sonde complète, moins urgent) :
+**Priorité 3 (charge GS en vue dense)** : ajouter **`DXMT_DEBUG_GS_STATS=1`** à l'environnement. Toutes les 10 s, le journal reçoit par paire VS+GS
+`gs stats: vs … gs … draws/s … vertices/s … instances/draw … object_tg/s …`. Recopier les lignes d'une fenêtre entièrement prise en vue dense fixe
+(et le fps de cette fenêtre) : c'est ce qui dit combien de triangles passent par les GS de près (vrais modèles d'arbres ou billboards).
+Les trois variables peuvent être posées ensemble pour un seul lancement.
+
+Le reste (sonde complète sur `gs-probe2`, seulement si les variables ne suffisent pas) :
 
 Runtime à construire depuis **`origin/gs-probe2`** (= `perf-gs` + 2 commits d'instrumentation, à ne pas fusionner).
 Il écrit dans `~/code/dxmt-gs-data/probe2/` (chemins codés en dur, rien à configurer) :
