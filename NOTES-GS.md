@@ -170,14 +170,46 @@ Géométrie seule (rastérisation coupée, `NORASTER=1`) :
   Le corriger changerait le rendu par rapport à la base : hors périmètre.
 - Les shaders de WARNO convertis par `cc3d8a81` sont identiques à l'octet près à ceux de `4d0b7d2a`.
 
-## 9. Reste à faire
+## 9. Mesures en jeu (session `s1`, 2026-11-15 20:02-20:08, verrou tenu 6 min 05 s)
 
-- [ ] Session jeu ≤ 10 min : A/B base contre `perf-gs`, Élevé (chargement direct) puis Moyen (bascule en jeu), captures.
-      Script : `~/code/dxmt-gs-data/session.sh <tag> <payload A> <payload B>` (verrou, mesures, restauration, chien de garde 540 s).
-      Payloads figés : `~/code/dxmt-gs-data/p-base` (`eb1a631f`), `p-opt1` (`58b45832`), `p-opt2` (`cc3d8a81`, version finale).
-- [ ] Si le canal Vertex reste haut : Metal System Trace sur le build optimisé pour voir ce qui reste.
+Même session, dos à dos, scène Hesse au déploiement, 2560×1600, 3D 1920, tout le reste au maximum. HUD Metal, 2 lectures à 10 s d'écart.
 
-## 10. Banc
+| Shaders | Base `eb1a631f` | `perf-gs` `cc3d8a81` | Gain |
+|---|---|---|---|
+| **Élevé** (chargé directement, `ShaderQuality = 0`) | 21,24 fps, GPU 47,17 ms | **89,03 fps, GPU 11,32 ms** | × 4,19 |
+| **Moyen** (basculé en jeu) | 21,56 fps, GPU 46,46 ms | **91,24 fps, GPU 11,05 ms** | × 4,23 |
+
+- Lectures brutes : optimisé Élevé 88,72 / 89,33 ; Moyen 91,21 / 91,27. Base Élevé 21,21 / 21,27 ; Moyen 21,59 / 21,54.
+- ioreg : Device 99 % dans les quatre cas. Le GPU reste saturé, à 89 fps au lieu de 21.
+- Rappel : Bas = 134-150 fps, GPU ~6 ms. Élevé coûte maintenant ~5 ms de plus que Bas, contre ~41 ms avant.
+
+Rendu, captures plein écran `~/code/dxmt-gs-data/captures/` (`s1-A-*` = optimisé, `s1-B-*` = base), comparées par `imgdiff.py`
+(part des pixels dont un canal diffère de plus de 8/255, de plus de 32/255) :
+
+| Paire | > 8 | > 32 |
+|---|---|---|
+| Bruit : même build, 10 s d'écart (base ; optimisé) | 7,7 % ; 14,1 % | 0,17 % ; 0,28 % |
+| Base contre optimisé, Élevé (t = 5 s ; t = 15 s) | 3,6 % ; 4,4 % | 0,11 % ; 0,18 % |
+| Base contre optimisé, Moyen (t = 5 s ; t = 15 s) | 3,3 % ; 2,2 % | 0,14 % ; 0,16 % |
+
+- L'écart base/optimisé est **sous le bruit d'animation** d'un même build. Le pavé le plus différent (`captures/eleve-base-vs-opt-worst.png`) :
+  forêt et ruines, ombres des arbres et des bâtiments présentes des deux côtés, seule la fumée animée change.
+- La preuve au bit près est celle du banc hors-jeu (section 8) ; en jeu, la scène est animée.
+
+Non fait :
+- **Trace Metal du build optimisé** : `xctrace` coupé à 40 s avant la fin de sa finalisation, trace inexploitable. Pas de ventilation Vertex/Fragment de ce qui reste.
+  `session.sh` laisse maintenant 120 s.
+- **Combat** (`run_combat.sh`) : non mesuré en Élevé. Référence en Bas : ~70 fps en 4v4.
+
+## 10. Reste à faire
+
+- [ ] Mesurer Élevé en combat 4v4 (`run_combat.sh`), où le CPU compte davantage.
+- [ ] Trace Metal du build optimisé pour ventiler les ~11 ms restants.
+- [ ] Chemins relus mais jamais exécutés : sorties GS point et ligne, GS instancié, draws GS indirects, GS DXIL (laissés à 1 thread).
+- [ ] Session jeu : `~/code/dxmt-gs-data/session.sh <tag> <payload A> <payload B>` (verrou, mesures, restauration, chien de garde 540 s).
+      Payloads figés : `~/code/dxmt-gs-data/p-base` (`eb1a631f`), `p-opt1` (`58b45832`), `p-opt2` (`cc3d8a81`, version finale mesurée).
+
+## 11. Banc
 
 - Build : `scratchpad/mkpayload.sh <dest>` (compile + install build64/build32, assemble `wine/…`). Payload de base : build de `eb1a631f`.
 - Session jeu : `game.sh lock gs` → install → `load_save.sh` → `bench.sh` → `restore` + `stop` + Option.ini validé + `METAL_HUD=0` → `unlock gs`. 10 min max.
