@@ -16,7 +16,7 @@ Le bytecode vient des shaders dumpés de WARNO (`~/code/dxmt-gs-data/gsprobe/*.c
 ./mklibs.sh <ancien>/airconv libs/base
 ./mklibs.sh <nouveau>/airconv libs/new
 swiftc -O real.swift -o real
-for s in A B C S; do ./real libs/base $s legacy; ./real libs/new $s new; done
+for s in A B C S N; do ./real libs/base $s legacy; ./real libs/new $s new; done
 ```
 
 L'empreinte `profondeur` doit être identique entre `legacy` et `new` pour chaque scénario.
@@ -27,13 +27,15 @@ L'empreinte `profondeur` doit être identique entre `legacy` et `new` pour chaqu
 | B | 203 draws × 5 759 instances d'un quad, les billboards d'arbres (VS `ee4035d1` + GS `e9bce06f`) |
 | C | shaders de B, nombres d'indices (1 à 60) et d'instances (1 à 300) variés : paquets d'instances, warps partiels |
 | S | shaders de A en triangle strip, avec index de coupure : 25 threads par mesh threadgroup, 2 threadgroups par warp |
+| N | draws non indexés, VS qui tire lui-même ses sommets de deux buffers, 3 registres de sortie (VS `6cb6fd2a` + GS `73747483`) |
 
 `legacy` = dispatch d'origine (payload 16 256 o, 1 thread par mesh threadgroup, un warp par instance).
 `new` = dispatch de `perf-gs`. `new1` = dispatch du commit `58b45832` (warps de 30), pour comparer les deux étapes.
 `NORASTER=1` coupe la rastérisation : coût de la géométrie seule. Le banc recopie ce que font `GeometryDraw*` et `d3d11_pipeline_gs.cpp` : à tenir à jour.
 
 Contrôle négatif : `./real libs/new B legacy` donne une autre empreinte.
-Données adverses : `ADV=casc0|cascmax|instnan|inst0|insthuge` (cascades nulles ou à INT_MAX, instances NaN, nulles, quads géants).
+Données adverses : `ADV=casc0|cascmax|instnan|inst0|insthuge|vertnan|vertinf` (cascades nulles ou à INT_MAX, instances NaN, nulles,
+quads géants, sommets NaN ou infinis épars).
 
 ## `bench.swift` + `gs.metal` : modèle synthétique en MSL
 

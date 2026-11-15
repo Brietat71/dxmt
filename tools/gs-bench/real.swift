@@ -12,7 +12,7 @@ let frames = a.count > 4 ? Int(a[4])! : 12
 let dev = MTLCreateSystemDefaultDevice()!
 let q = dev.makeCommandQueue()!
 
-let nreg = scen == "A" ? 1 : 2; let shaders = scen == "C" ? "B" : scen                                // registres de sortie du VS
+let nreg = scen == "N" ? 3 : scen == "A" ? 1 : 2; let shaders = scen == "C" ? "B" : scen                                // registres de sortie du VS
 let strip = scen == "S"                                       // S : shaders de A, topologie triangle strip
 // miroir de airconv_public.h : SM50GSWarpScale, SM50GSPayloadSize, SM50GSMeshThreadsLimit, et de GetGeometryDrawLayout
 let scale = isNew && !phase1 && !strip && 16 + 64 * (4 + 16 * nreg) <= 16256 ? 2 : 1
@@ -60,12 +60,42 @@ let bCasc = buf(casc)
 let tbd = MTLTextureDescriptor.textureBufferDescriptor(with: .r32Sint, width: casc.count, resourceOptions: .storageModeShared, usage: .shaderRead)
 let tCasc = bCasc.makeTexture(descriptor: tbd, offset: 0, bytesPerRow: casc.count * 4)!
 let meshTable = buf([UInt64]([tCasc.gpuResourceID._impl, UInt64(casc.count) << 32]))
-let cbTable = buf([UInt64]([cb.gpuAddress]))
+// N : le VS lit un décalage entier dans cb4[3].x ; son GS prend la matrice lumière dans cb0[1..3]
+let cbNV = buf([Float]([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0]))
+let cbNG = buf([Float]([0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0]))
+let cbTable = buf([UInt64]([scen == "N" ? cbNV.gpuAddress : cb.gpuAddress]))
+let cbTableMesh = buf([UInt64]([scen == "N" ? cbNG.gpuAddress : cb.gpuAddress]))
 
 var args = [DrawArgs](), resources = [MTLResource](), objTable: MTLBuffer? = nil
 var vbTable: MTLBuffer, ib: MTLBuffer
+var nArgs: MTLBuffer? = nil   // scénario N : DXMT_DRAW_ARGUMENTS (4 mots, pas 5)
 let draws: Int
-if scen == "A" || strip {
+if scen == "N" {
+  // N : draws non indexés, le VS tire lui-même ses sommets de deux buffers (t1 = indices, t0 = 8 mots par sommet)
+  draws = a.count > 5 ? Int(a[5])! : 1200
+  let nv = 60000
+  var vdata = [UInt32](), idx = [UInt32](), raw = [UInt32]()
+  for _ in 0..<nv { vdata += [(rnd() * 1900 - 950).bitPattern, (rnd() * 1900 - 950).bitPattern, (rnd() * 50).bitPattern, 0, UInt32(rnd() * 65535) | UInt32(rnd() * 65535) << 16, UInt32(rnd() * 4e9), 0, 0] }
+  // triangles petits : trois sommets voisins dans une grille de sommets triés serait mieux ; ici on prend un sommet et on perturbe
+  for i in 0..<nv { let b = i / 3 * 3; if i % 3 != 0 { vdata[8 * i] = (Float(bitPattern: vdata[8 * b]) + rnd() * 30 - 15).bitPattern; vdata[8 * i + 1] = (Float(bitPattern: vdata[8 * b + 1]) + rnd() * 30 - 15).bitPattern } }
+  for i in 0..<600000 { idx.append(UInt32((i / 3 * 3 + i % 3) % nv)) }
+  let counts: [UInt32] = [1500, 3, 6, 30, 27, 60, 61, 300, 7, 4500, 33, 12, 999, 2]
+  var start: UInt32 = 0
+  for d in 0..<draws {
+    let c = counts[d % counts.count]
+    raw += [c, UInt32(1 + d % 3), start, 0, 0, 0, 0, 0]; start = (start + c * 7) % 500000
+    args.append(DrawArgs(indexCount: c, instanceCount: UInt32(1 + d % 3), startIndex: 0, baseVertex: 0, startInstance: 0))
+  }
+  let bt0 = buf(vdata), bt1 = buf(idx)
+  func tb(_ b: MTLBuffer, _ n: Int) -> MTLTexture {
+    b.makeTexture(descriptor: MTLTextureDescriptor.textureBufferDescriptor(with: .r32Uint, width: n, resourceOptions: .storageModeShared, usage: .shaderRead), offset: 0, bytesPerRow: n * 4)!
+  }
+  let tt0 = tb(bt0, vdata.count), tt1 = tb(bt1, idx.count)
+  objTable = buf([UInt64]([tt0.gpuResourceID._impl, UInt64(vdata.count) << 32, tt1.gpuResourceID._impl, UInt64(idx.count) << 32]))
+  nArgs = buf(raw)
+  vbTable = cbTable; ib = cbTable   // non utilisés
+  resources = [bt0, bt1, tt0, tt1]
+} else if scen == "A" || strip {
   // 1450 draws x 498 petits triangles indexés 16 bits, sommets propres à chaque draw (BaseVertex)
   draws = a.count > 5 ? Int(a[5])! : 1450
   let tris = 498, vpd = tris * 3 / 2
@@ -78,6 +108,9 @@ if scen == "A" || strip {
   for i in 0..<(tris * 3) { idx.append(strip && i % 53 == 52 ? 0xFFFF : UInt16(rnd() * Float(vpd))) }
   // strip : longueurs variées, pour les warps partiels
   for d in 0..<draws { args.append(DrawArgs(indexCount: UInt32(strip ? 3 + (d * 37) % 900 : tris * 3), instanceCount: 1, startIndex: 0, baseVertex: Int32(d * vpd), startInstance: 0)) }
+  // sommets NaN / infinis épars : des triangles dont un seul sommet est invalide (min/max « rapides » ambigus)
+  if adv.contains("vertnan") { for i in 0..<vb.count where i % 37 == 5 { vb[i] = Float.nan } }
+  if adv.contains("vertinf") { for i in 0..<vb.count where i % 41 == 7 { vb[i] = i % 2 == 0 ? Float.infinity : -Float.infinity } }
   let bv = buf(vb); ib = buf(idx)
   vbTable = buf([VBEntry(addr: bv.gpuAddress, stride: 12, length: UInt32(bv.length))])
   resources = [bv]
@@ -115,7 +148,7 @@ if scen == "A" || strip {
   objTable = buf([UInt64]([smp.gpuResourceID._impl, smp.gpuResourceID._impl, 0, tex.gpuResourceID._impl, 0]))
   resources = [quad, bi, tex]
 }
-let bArgs = buf(args)
+let bArgs = nArgs ?? buf(args)
 
 func frame(readback: MTLBuffer?) -> Double {
   let cmd = q.makeCommandBuffer()!
@@ -124,13 +157,13 @@ func frame(readback: MTLBuffer?) -> Double {
   rp.depthAttachment.clearDepth = 1; rp.renderTargetArrayLength = 4
   let e = cmd.makeRenderCommandEncoder(descriptor: rp)!
   e.setDepthStencilState(dss); e.setRenderPipelineState(pso)
-  for r in resources + [cb, tCasc, bCasc] as [MTLResource] { e.useResource(r, usage: .read, stages: [.object, .mesh]) }
+  for r in resources + [cb, cbNV, cbNG, tCasc, bCasc] as [MTLResource] { e.useResource(r, usage: .read, stages: [.object, .mesh]) }
   e.setObjectBuffer(cbTable, offset: 0, index: 0)
   if let t = objTable { e.setObjectBuffer(t, offset: 0, index: 1) }
   e.setObjectBuffer(vbTable, offset: 0, index: 2)
   e.setObjectBuffer(ib, offset: 0, index: 3)
   e.setObjectBuffer(bArgs, offset: 0, index: 4)
-  e.setMeshBuffer(cbTable, offset: 0, index: 0)
+  e.setMeshBuffer(cbTableMesh, offset: 0, index: 0)
   e.setMeshBuffer(meshTable, offset: 0, index: 1)
   for (i, d) in args.enumerated() {
     e.setObjectBufferOffset(i * MemoryLayout<DrawArgs>.stride, index: 4)

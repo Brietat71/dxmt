@@ -257,6 +257,12 @@ par un draw instancié × cascades dont l'étage vertex sort la couche (`render_
 - Banc aux vrais shaders, données adverses (`ADV=`), ancien et nouveau chemin : cascades nulles, cascades à INT_MAX, instances NaN,
   instances nulles → aucune erreur GPU, sorties identiques (vides). Quads géants (`insthuge`) → **9,3 s de GPU par frame sans erreur**, sorties identiques.
 - Charge géométrie extrême : 8 000 draws × 5 759 instances → 71 ms (nouveau), **1,34 s (ancien)**, sans erreur.
+- Sommets NaN ou infinis épars (un seul sommet invalide par triangle, cas où les `min`/`max` « rapides » pourraient diverger
+  entre la passe de comptage et la passe d'écriture) : sorties identiques, aucune erreur.
+- Désaccord forcé entre les deux passes (expérience : les threads impairs comptent mais n'écrivent pas) : aucune erreur, et la sortie est
+  celle d'un saut propre. Les primitives comptées mais jamais écrites ne rendent rien sur ce GPU. Pas de garde ajoutée.
+- Nouveau scénario `N` du banc (draws non indexés, troisième paire de vrais shaders, 3 registres de sortie du VS) : identique au bit près.
+- L'erreur est **reproductible à la première frame du menu** (frames 375 puis 380 sur deux lancements arm64 en Élevé).
 - Donc ni la durée d'un tampon ni des données dégénérées ne suffisent à produire un hang ici. Rien dans le chemin regroupé n'écrit hors de ses bornes
   (relecture + sorties au bit près), sauf si le pipeline lié n'est pas celui du draw. Attribution impossible sans le jeu : voir la demande 4.
 

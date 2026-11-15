@@ -11,4 +11,7 @@ $A -S --geometry-after-vertex=$D/$GB.cso --ia-layout=0:0:0:29,1:1:0:31:1,2:1:16:
 $A -S --geometry-after-vertex=$D/$GA.cso --ia-layout=0:0:0:30 --ia-index-format=1 $D/$VA.cso -o $O/A_obj.ll
 $A -A --gs-strip --geometry-after-vertex=$D/$GA.cso --ia-layout=0:0:0:30 --ia-index-format=1 $D/$VA.cso -o $O/S_obj.metallib
 $A -A --gs-strip --vertex-before-geometry=$D/$VA.cso $D/$GA.cso -o $O/S_mesh.metallib
+VN=6cb6fd2a09f84cd6ec0c06a9e09896b0c192980e; GN=73747483a028d90b1853541589cbf912fd9f3953
+$A -A --geometry-after-vertex=$D/$GN.cso $D/$VN.cso -o $O/N_obj.metallib
+$A -A --vertex-before-geometry=$D/$VN.cso $D/$GN.cso -o $O/N_mesh.metallib
 ls -la $O | awk '{print $5, $NF}'
