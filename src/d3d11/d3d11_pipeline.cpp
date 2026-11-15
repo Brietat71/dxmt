@@ -12,13 +12,13 @@ class MTLCompiledGraphicsPipelineImpl
     : public MTLCompiledGraphicsPipeline {
 public:
   MTLCompiledGraphicsPipelineImpl(MTLD3D11Device *pDevice,
-                              MTL_GRAPHICS_PIPELINE_DESC *pDesc)
+                              MTL_GRAPHICS_PIPELINE_DESC *pDesc, bool background)
       : num_rtvs(pDesc->NumColorAttachments),
         depth_stencil_format(pDesc->DepthStencilFormat),
         topology_class(pDesc->TopologyClass), device_(pDevice),
         pBlendState(pDesc->BlendState),
         RasterizationEnabled(pDesc->RasterizationEnabled),
-        SampleCount(pDesc->SampleCount) {
+        SampleCount(pDesc->SampleCount), background_(background) {
     uint32_t unorm_output_reg_mask = 0;
     for (unsigned i = 0; i < num_rtvs; i++) {
       rtv_formats[i] = pDesc->ColorAttachmentFormats[i];
@@ -28,17 +28,17 @@ public:
     if (pDesc->SOLayout) {
       VertexShader =
           pDesc->VertexShader->get_shader(ShaderVariantVertexStreamOutput{
-              pDesc->InputLayout, (uint64_t)pDesc->SOLayout});
+              pDesc->InputLayout, (uint64_t)pDesc->SOLayout}, background);
     } else {
       VertexShader = pDesc->VertexShader->get_shader(ShaderVariantVertex{
-          pDesc->InputLayout, pDesc->GSPassthrough, !pDesc->RasterizationEnabled});
+          pDesc->InputLayout, pDesc->GSPassthrough, !pDesc->RasterizationEnabled}, background);
     }
 
     if (pDesc->PixelShader) {
       PixelShader = pDesc->PixelShader->get_shader(ShaderVariantPixel{
           pDesc->SampleMask, pDesc->BlendState->IsDualSourceBlending(),
           depth_stencil_format == WMTPixelFormatInvalid,
-          unorm_output_reg_mask});
+          unorm_output_reg_mask}, background);
       ps_valid_render_targets = pDesc->PixelShader->reflection().PSValidRenderTargets;
     } else {
       PixelShader = nullptr;
@@ -99,7 +99,11 @@ public:
     state_ = device_->GetMTLDevice().newRenderPipelineState(info, err);
 
     if (state_ == nullptr) {
-      ERR("Failed to create PSO: ", err.description().getUTF8String());
+      /* neutron: a primed pipeline pairs the shader with a guessed partner */
+      if (background_)
+        TRACE("Failed to create primed PSO: ", err.description().getUTF8String());
+      else
+        ERR("Failed to create PSO: ", err.description().getUTF8String());
       return this;
     }
 
@@ -113,6 +117,10 @@ public:
   void SetIsDone(bool state) {
     ready_.store(state);
     ready_.notify_all();
+  }
+
+  ThreadpoolWork *GetDependency(unsigned index) {
+    return index == 0 ? VertexShader : index == 1 ? PixelShader : nullptr;
   }
 
 private:
@@ -129,20 +137,21 @@ private:
   WMT::Reference<WMT::RenderPipelineState> state_;
   bool RasterizationEnabled;
   UINT SampleCount;
+  bool background_;
 };
 
 std::unique_ptr<MTLCompiledGraphicsPipeline>
 CreateGraphicsPipeline(MTLD3D11Device *pDevice,
-                       MTL_GRAPHICS_PIPELINE_DESC *pDesc) {
-  return std::make_unique<MTLCompiledGraphicsPipelineImpl>(pDevice, pDesc);
+                       MTL_GRAPHICS_PIPELINE_DESC *pDesc, bool background) {
+  return std::make_unique<MTLCompiledGraphicsPipelineImpl>(pDevice, pDesc, background);
 }
 
 class MTLCompiledComputePipelineImpl
     : public MTLCompiledComputePipeline {
 public:
-  MTLCompiledComputePipelineImpl(MTLD3D11Device *pDevice, ManagedShader shader)
+  MTLCompiledComputePipelineImpl(MTLD3D11Device *pDevice, ManagedShader shader, bool background)
       : device_(pDevice) {
-    ComputeShader = shader->get_shader(ShaderVariantDefault{});
+    ComputeShader = shader->get_shader(ShaderVariantDefault{}, background);
     uint32_t total_tgsize = shader->reflection().ThreadgroupSize[0] *
                             shader->reflection().ThreadgroupSize[1] *
                             shader->reflection().ThreadgroupSize[2];
@@ -191,6 +200,8 @@ public:
     ready_.notify_all();
   }
 
+  ThreadpoolWork *GetDependency(unsigned index) { return index == 0 ? ComputeShader : nullptr; }
+
 private:
   MTLD3D11Device *device_;
   std::atomic_bool ready_;
@@ -200,8 +211,8 @@ private:
 };
 
 std::unique_ptr<MTLCompiledComputePipeline>
-CreateComputePipeline(MTLD3D11Device *pDevice, ManagedShader ComputeShader) {
-  return std::make_unique<MTLCompiledComputePipelineImpl>(pDevice, ComputeShader);
+CreateComputePipeline(MTLD3D11Device *pDevice, ManagedShader ComputeShader, bool background) {
+  return std::make_unique<MTLCompiledComputePipelineImpl>(pDevice, ComputeShader, background);
 }
 
 } // namespace dxmt

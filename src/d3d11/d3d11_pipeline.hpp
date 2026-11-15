@@ -167,10 +167,13 @@ public:
   virtual void GetPipeline(MTL_COMPILED_TESSELLATION_MESH_PIPELINE *pTessellationPipeline) = 0;
 };
 
+/* neutron: background = speculative pipeline (priming, compute shader creation): its shaders are
+   converted with background priority */
 std::unique_ptr<MTLCompiledGraphicsPipeline>
-CreateGraphicsPipeline(MTLD3D11Device *pDevice, MTL_GRAPHICS_PIPELINE_DESC *pDesc);
+CreateGraphicsPipeline(MTLD3D11Device *pDevice, MTL_GRAPHICS_PIPELINE_DESC *pDesc, bool background = false);
 
-std::unique_ptr<MTLCompiledComputePipeline> CreateComputePipeline(MTLD3D11Device *pDevice, ManagedShader ComputeShader);
+std::unique_ptr<MTLCompiledComputePipeline>
+CreateComputePipeline(MTLD3D11Device *pDevice, ManagedShader ComputeShader, bool background = false);
 
 std::unique_ptr<MTLCompiledGeometryPipeline>
 CreateGeometryPipeline(MTLD3D11Device *pDevice, MTL_GRAPHICS_PIPELINE_DESC *pDesc);

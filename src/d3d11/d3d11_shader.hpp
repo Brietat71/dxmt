@@ -191,6 +191,9 @@ public:
   virtual ThreadpoolWork *RunThreadpoolWork() = 0;
   virtual bool GetIsDone() = 0;
   virtual void SetIsDone(bool state) = 0;
+  /* neutron: the shader tasks a pipeline waits for, to move them to the foreground queue when a
+     draw needs a pipeline that was compiled in the background */
+  virtual ThreadpoolWork *GetDependency(unsigned index) { return nullptr; }
 };
 
 class CompiledShader : public ThreadpoolWork {
@@ -211,7 +214,8 @@ public:
   virtual MTL_SHADER_REFLECTION &reflection() = 0;
   virtual MTL_SM50_SHADER_ARGUMENT *constant_buffers_info() = 0;
   virtual MTL_SM50_SHADER_ARGUMENT *arguments_info() = 0;
-  virtual CompiledShader *get_shader(ShaderVariant variant) = 0;
+  /* neutron: background = speculative (shader creation, pipeline priming), see dxmt_tasks.hpp */
+  virtual CompiledShader *get_shader(ShaderVariant variant, bool background = false) = 0;
   virtual const Sha1Digest& sha1() = 0;
   virtual void dump() = 0;
 
