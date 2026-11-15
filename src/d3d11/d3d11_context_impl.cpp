@@ -41,6 +41,10 @@
 #include "util_flags.hpp"
 #include "util_math.hpp"
 #include "util_win32_compat.h"
+#include <fstream>
+#include <chrono>
+#include <mutex>
+#include <unordered_map>
 
 namespace dxmt {
 
@@ -1536,11 +1540,45 @@ public:
     });
   }
 
+  void GSProbe(UINT Count, UINT InstanceCount, bool indexed) {
+    struct St { uint64_t draws = 0, verts = 0, inst = 0, maxv = 0, topo = 0, idx = 0; uint64_t hist[8] = {}; };
+    static std::mutex mtx;
+    static std::unordered_map<std::string, St> stats;
+    static auto last = std::chrono::steady_clock::now();
+    auto gs = state_.ShaderStages[PipelineStage::Geometry].Shader->GetManagedShader()->sha1().string();
+    auto vs = state_.ShaderStages[PipelineStage::Vertex].Shader->GetManagedShader()->sha1().string();
+    std::lock_guard<std::mutex> l(mtx);
+    auto &st = stats[vs.substr(0, 12) + " " + gs.substr(0, 12)];
+    st.draws++;
+    st.verts += uint64_t(Count) * InstanceCount;
+    st.inst += InstanceCount;
+    st.maxv = std::max<uint64_t>(st.maxv, Count);
+    st.topo = state_.InputAssembler.Topology;
+    st.idx = indexed;
+    unsigned b = 0;
+    for (UINT c = Count; c > 1 && b < 7; c >>= 3) b++;
+    st.hist[b]++;
+    auto now = std::chrono::steady_clock::now();
+    if (now - last > std::chrono::seconds(10)) {
+      double dt = std::chrono::duration<double>(now - last).count();
+      std::ofstream f(GS_PROBE_DIR + "stats.txt", std::ios::app);
+      f << "=== window " << dt << " s\n";
+      for (auto &[k, v] : stats)
+        f << k << " draws/s=" << v.draws / dt << " verts/s=" << v.verts / dt << " inst/draw=" << double(v.inst) / v.draws
+          << " maxv=" << v.maxv << " topo=" << v.topo << " idx=" << v.idx << " hist8^k=" << v.hist[0] << "," << v.hist[1]
+          << "," << v.hist[2] << "," << v.hist[3] << "," << v.hist[4] << "," << v.hist[5] << "," << v.hist[6] << ","
+          << v.hist[7] << "\n";
+      stats.clear();
+      last = now;
+    }
+  }
+
   void
   GeometryDraw(
       UINT VertexCountPerInstance, UINT InstanceCount, UINT StartVertexLocation,
       UINT StartInstanceLocation
   ) {
+    GSProbe(VertexCountPerInstance, InstanceCount, false);
     auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_ARGUMENTS), 32);
     auto max_object_threadgroups = max_object_threadgroups_;
     EmitOP([=, topo = state_.InputAssembler.Topology](ArgumentEncodingContext &enc) {
@@ -1574,6 +1612,7 @@ public:
       UINT IndexCountPerInstance, UINT StartIndexLocation, INT BaseVertexLocation,
       UINT InstanceCount, UINT BaseInstance
   ) {
+    GSProbe(IndexCountPerInstance, InstanceCount, true);
     auto IndexBufferOffset = state_.InputAssembler.IndexBufferOffset;
     auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_INDEXED_ARGUMENTS), 32);
     auto max_object_threadgroups = max_object_threadgroups_;
