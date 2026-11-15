@@ -106,7 +106,34 @@ _NSAutoreleasePool_alloc_init(void *obj) {
 static NTSTATUS
 _MTLCommandQueue_commandBuffer(void *obj) {
   struct unixcall_generic_obj_obj_ret *params = obj;
-  params->ret = (obj_handle_t)[(id<MTLCommandQueue>)params->handle commandBuffer];
+  /*
+   * DXMT_DEBUG_ENCODER_STATUS=1: when a command buffer fails (GPU hang, page fault...), print the
+   * execution status of each of its encoders, with their labels, to stderr: tells which pass faulted.
+   */
+  static int encoder_status = -1;
+  if (encoder_status < 0)
+    encoder_status = getenv("DXMT_DEBUG_ENCODER_STATUS") != NULL;
+  if (!encoder_status) {
+    params->ret = (obj_handle_t)[(id<MTLCommandQueue>)params->handle commandBuffer];
+    return STATUS_SUCCESS;
+  }
+  MTLCommandBufferDescriptor *desc = [[MTLCommandBufferDescriptor alloc] init];
+  desc.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+  id<MTLCommandBuffer> cmdbuf = [(id<MTLCommandQueue>)params->handle commandBufferWithDescriptor:desc];
+  [desc release];
+  [cmdbuf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+    if (!cb.error)
+      return;
+    NSArray<id<MTLCommandBufferEncoderInfo>> *infos = cb.error.userInfo[MTLCommandBufferEncoderInfoErrorKey];
+    fprintf(stderr, "dxmt: command buffer error: %s\n", cb.error.localizedDescription.UTF8String);
+    static const char *const state_name[] = {"unknown", "completed", "affected", "pending", "FAULTED"};
+    for (id<MTLCommandBufferEncoderInfo> info in infos)
+      fprintf(
+          stderr, "dxmt:   %-9s %s\n", (unsigned long)info.errorState < 5 ? state_name[info.errorState] : "?",
+          info.label.UTF8String
+      );
+  }];
+  params->ret = (obj_handle_t)cmdbuf;
   return STATUS_SUCCESS;
 }
 
