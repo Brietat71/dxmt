@@ -1963,8 +1963,13 @@ public:
     std::lock_guard<mutex_t> lock(mutex);
 
     if (auto expected = com_cast<IMTLD3D11InputLayout>(pInputLayout)) {
+      /* neutron: the same layout again keeps the pipeline (engines set it for every draw) */
+      if (state_.InputAssembler.InputLayout.ptr() == expected.ptr())
+        return;
       state_.InputAssembler.InputLayout = std::move(expected);
     } else {
+      if (!state_.InputAssembler.InputLayout)
+        return;
       state_.InputAssembler.InputLayout = nullptr;
     }
     InvalidateRenderPipeline();
@@ -3027,14 +3032,11 @@ public:
         should_invalidate_pipeline = true;
       }
     }
-    if (BlendFactor) {
-      memcpy(state_.OutputMerger.BlendFactor, BlendFactor, sizeof(float[4]));
-    } else {
-      state_.OutputMerger.BlendFactor[0] = 1.0f;
-      state_.OutputMerger.BlendFactor[1] = 1.0f;
-      state_.OutputMerger.BlendFactor[2] = 1.0f;
-      state_.OutputMerger.BlendFactor[3] = 1.0f;
-    }
+    /* neutron: only a changed blend factor needs the command (a new render pass sets it anyway) */
+    static const float kDefaultBlendFactor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    const float *NewBlendFactor = BlendFactor ? BlendFactor : kDefaultBlendFactor;
+    bool blend_factor_changed = memcmp(state_.OutputMerger.BlendFactor, NewBlendFactor, sizeof(float[4])) != 0;
+    memcpy(state_.OutputMerger.BlendFactor, NewBlendFactor, sizeof(float[4]));
     if (state_.OutputMerger.SampleMask != SampleMask) {
       state_.OutputMerger.SampleMask = SampleMask;
       should_invalidate_pipeline = true;
@@ -3042,7 +3044,8 @@ public:
     if (should_invalidate_pipeline) {
       InvalidateRenderPipeline();
     }
-    dirty_state.set(DirtyState::BlendFactorAndStencilRef);
+    if (blend_factor_changed)
+      dirty_state.set(DirtyState::BlendFactorAndStencilRef);
   }
   void
   STDMETHODCALLTYPE
@@ -3069,11 +3072,14 @@ public:
   OMSetDepthStencilState(ID3D11DepthStencilState *pDepthStencilState, UINT StencilRef) override {
     std::lock_guard<mutex_t> lock(mutex);
 
+    IMTLD3D11DepthStencilState *NewState = nullptr;
     if (auto expected = com_cast<IMTLD3D11DepthStencilState>(pDepthStencilState)) {
-      state_.OutputMerger.DepthStencilState = expected.ptr();
-    } else {
-      state_.OutputMerger.DepthStencilState = nullptr;
+      NewState = expected.ptr();
     }
+    /* neutron: the same state and stencil reference again emit no command (a new render pass sets it anyway) */
+    if (state_.OutputMerger.DepthStencilState == NewState && state_.OutputMerger.StencilRef == StencilRef)
+      return;
+    state_.OutputMerger.DepthStencilState = NewState;
     state_.OutputMerger.StencilRef = StencilRef;
     dirty_state.set(DirtyState::DepthStencilState);
   }
