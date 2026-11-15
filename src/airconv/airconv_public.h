@@ -5,7 +5,7 @@
 #ifndef __AIRCONV_H
 #define __AIRCONV_H
 
-#define AIRCONV_VERSION 26
+#define AIRCONV_VERSION 27
 
 #ifdef __cplusplus
 #include <string>
@@ -88,7 +88,56 @@ struct MTL_GEOMETRY_SHADER_REFLECTION {
     uint32_t GSPassThrough;
   };
   uint32_t Primitive;
+  /* GS invocations a mesh threadgroup can hold, see SM50GSMeshThreadsLimit() */
+  uint8_t MeshThreadsLimit;
+  uint8_t PrimitivesPerWarpStrip;
+  uint8_t VerticesPerPrimitive;
+  uint8_t Reserved;
 };
+
+/*
+ * Geometry shader emulation layout: shared by the converter (object/mesh shaders),
+ * the pipeline and the draw encoder. They must agree.
+ */
+
+/*
+ * A warp is the batch of vertices of one object threadgroup. Warps of list topologies hold twice
+ * the vertices of the base layout (up to 64) when the payload has room for them.
+ */
+static inline uint32_t SM50GSWarpScale(uint32_t NumVertexOutputElement, uint32_t VerticesPerPrimitive, bool Strip) {
+  return !Strip && VerticesPerPrimitive >= 2 && 16 + 64 * (4 + 16 * NumVertexOutputElement) <= 16256 ? 2 : 1;
+}
+
+/*
+ * object payload: 4 header words, one validity word per vertex,
+ * then one float4 per vertex output register and vertex
+ */
+static inline uint32_t SM50GSPayloadSize(uint32_t NumVertexOutputElement, uint32_t WarpScale) {
+  uint32_t size = 16 + 32 * WarpScale * (4 + 16 * NumVertexOutputElement);
+  // ponytail: as before, a VS with 32 output registers does not fit (16528 bytes) and overruns the
+  // payload. Shrink its warp if such a shader ever feeds a GS.
+  return size < 16256 ? size : 16256;
+}
+
+/*
+ * GS invocations (threads) a mesh threadgroup can hold. Metal allows 256 vertices per mesh;
+ * each invocation owns MaxVertexCount vertices plus one scratch vertex.
+ */
+static inline uint32_t SM50GSMeshThreadsLimit(uint32_t MaxVertexCount) {
+  uint32_t n = 256 / (MaxVertexCount + 1);
+  return n < 1 ? 1 : n > 64 ? 64 : n;
+}
+
+/*
+ * Instances packed in one object threadgroup (1 = one warp per instance, no packing).
+ * Small instanced draws of list topologies only: PackUnit is the vertex count of an input
+ * primitive, 0 for strips.
+ */
+static inline uint32_t SM50GSInstancesPerWarp(uint32_t VertexCount, uint32_t VerticesPerWarp, uint32_t PackUnit) {
+  if (!PackUnit || !VertexCount || VertexCount > VerticesPerWarp / 2 || VertexCount % PackUnit)
+    return 1;
+  return VerticesPerWarp / VertexCount;
+}
 
 struct MTL_POST_TESSELLATOR_REFLECTION {
   uint32_t MaxPotentialTessFactor;
@@ -97,6 +146,11 @@ struct MTL_POST_TESSELLATOR_REFLECTION {
 struct MTL_PIXEL_SHADER_REFLECTION {
   uint32_t ValidRenderTargets;
   uint32_t HasCoverageOutput;
+  /**
+  the shader samples a texture inside nested loops: a single invocation can run for a very long time
+  (e.g. brute-force convolution of an environment map)
+   */
+  uint32_t HasNestedSamplingLoop;
 };
 
 struct MTL_SHADER_REFLECTION {

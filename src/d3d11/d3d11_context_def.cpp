@@ -447,6 +447,10 @@ public:
       // nop
   };
 
+  bool FlushAndWait() override {
+    return false; // never called: draws are not isolated on a deferred context
+  }
+
   HRESULT STDMETHODCALLTYPE
   Signal(ID3D11Fence *pFence, UINT64 Value) override {
     return DXGI_ERROR_INVALID_CALL;

@@ -379,6 +379,7 @@ public:
   uint32_t gs_max_vertex_output = 0;
   uint32_t gs_instance_count = 1;
   uint32_t ps_has_coverage_output = 0;
+  uint32_t ps_has_nested_sampling_loop = 0;
 
   BasicBlock *entry() const {
     return bbs.front().get();
@@ -438,6 +439,13 @@ void setup_immediate_constant_buffer(
   const ShaderInfo *shader_info, io_binding_map &resource_map,
   air::AirType &types, llvm::Module &module, llvm::IRBuilder<> &builder
 );
+
+/* (vertices, primitives) of a warp, vertices per primitive */
+std::tuple<uint32_t, uint32_t, uint32_t>
+get_vertex_primitive_count_in_warp(microsoft::D3D10_SB_PRIMITIVE primitive, bool strip);
+
+/* GS invocations (threads) a mesh threadgroup can hold, see SM50GSMeshThreadsLimit() */
+uint32_t gs_mesh_threads_limit(const SM50ShaderInternal *pGeometryStage);
 
 llvm::Error convert_dxbc_geometry_shader(
   SM50ShaderInternal *pShaderInternal, const char *name,

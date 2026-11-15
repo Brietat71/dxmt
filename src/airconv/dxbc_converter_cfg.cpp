@@ -95,6 +95,8 @@ read_control_flow(
   auto bb_return = fresh_bb("returnbb");
   bb_return->target = BasicBlockReturn{};
 
+  uint32_t loop_depth = 0;
+
   bool sm_ver_5_1_ = Parser.ShaderMajorVersion() == 5 && Parser.ShaderMinorVersion() >= 1;
   auto &shader_info = sm50_shader->shader_info;
   auto &func_signature = sm50_shader->func_signature;
@@ -102,6 +104,22 @@ read_control_flow(
   while (!Parser.EndOfShader()) {
     D3D10ShaderBinary::CInstruction Inst;
     Parser.ParseInstruction(&Inst);
+
+    if (loop_depth >= 2) {
+      switch (Inst.OpCode()) {
+      case D3D10_SB_OPCODE_SAMPLE:
+      case D3D10_SB_OPCODE_SAMPLE_B:
+      case D3D10_SB_OPCODE_SAMPLE_C:
+      case D3D10_SB_OPCODE_SAMPLE_C_LZ:
+      case D3D10_SB_OPCODE_SAMPLE_D:
+      case D3D10_SB_OPCODE_SAMPLE_L:
+      case D3D10_SB_OPCODE_LD:
+        sm50_shader->ps_has_nested_sampling_loop = 1;
+        break;
+      default:
+        break;
+      }
+    }
 
     switch (Inst.OpCode()) {
 
@@ -139,9 +157,12 @@ read_control_flow(
 
       bb_current->target = BasicBlockUnconditionalBranch{loop_entrance};
       bb_current = loop_entrance;
+      loop_depth++;
       break;
     }
     case D3D10_SB_OPCODE_ENDLOOP: {
+      if (loop_depth)
+        loop_depth--;
       bb_current->target = BasicBlockUnconditionalBranch{bb_continue_target.top()};
       bb_current = bb_break_target.top();
       bb_continue_target.pop();

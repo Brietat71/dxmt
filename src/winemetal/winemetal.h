@@ -1512,6 +1512,7 @@ struct wmtcmd_render_dxmt_geometry_draw {
   uint32_t warp_count;
   uint32_t instance_count;
   uint32_t vertex_per_warp;
+  uint32_t mesh_threads;
 };
 
 struct wmtcmd_render_dxmt_geometry_draw_indexed {
@@ -1524,6 +1525,7 @@ struct wmtcmd_render_dxmt_geometry_draw_indexed {
   uint32_t warp_count;
   uint32_t instance_count;
   uint32_t vertex_per_warp;
+  uint32_t mesh_threads;
 };
 
 struct wmtcmd_render_dxmt_geometry_draw_indirect {
@@ -1536,6 +1538,7 @@ struct wmtcmd_render_dxmt_geometry_draw_indirect {
   obj_handle_t dispatch_args_buffer;
   uint64_t dispatch_args_offset;
   uint32_t vertex_per_warp;
+  uint32_t mesh_threads;
 };
 
 struct wmtcmd_render_dxmt_geometry_draw_indexed_indirect {
@@ -1550,6 +1553,7 @@ struct wmtcmd_render_dxmt_geometry_draw_indexed_indirect {
   obj_handle_t dispatch_args_buffer;
   uint64_t dispatch_args_offset;
   uint32_t vertex_per_warp;
+  uint32_t mesh_threads;
 };
 
 struct wmtcmd_render_fence_op {
