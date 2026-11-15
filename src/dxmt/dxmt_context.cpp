@@ -971,6 +971,19 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
                      std::to_string(color_count) + "c" + (data->depth.attachment ? "1d " : "0d ") +
                      std::to_string(data->render_target_width) + "x" + std::to_string(data->render_target_height) +
                      "x" + std::to_string(data->render_target_array_length);
+        // actions de chargement (L charge, C efface, D indifférent) / de stockage (S stocke, D jette, R résout) :
+        // une passe coupée en deux se voit à son L (rechargement des attachements)
+        const char *load_letter = "DLC", *store_letter = "DSRRUU";
+        label += " c";
+        for (auto &color : data->colors)
+          if (color.attachment)
+            label += load_letter[color.load_action];
+        label += "/";
+        for (auto &color : data->colors)
+          if (color.attachment)
+            label += store_letter[color.store_action];
+        if (data->depth.attachment)
+          label += std::string(" d") + load_letter[data->depth.load_action] + "/" + store_letter[data->depth.store_action];
         encoder.setLabel(WMT::String::string(label.c_str(), WMTUTF8StringEncoding));
       }
       data->fence_wait.forEach(
