@@ -197,6 +197,13 @@ CommandQueue::WaitForFinishThread() {
     if (chunk.attached_cmdbuf.status() <= WMTCommandBufferStatusScheduled) {
       chunk.attached_cmdbuf.waitUntilCompleted();
     }
+    if (measured_seq_id.load(std::memory_order_acquire) == internal_seq) {
+      measured_gpu_time.store(
+          MTLCommandBuffer_property(chunk.attached_cmdbuf.handle, WMTCommandBufferPropertyGPUEndTime) -
+              MTLCommandBuffer_property(chunk.attached_cmdbuf.handle, WMTCommandBufferPropertyGPUStartTime),
+          std::memory_order_release
+      );
+    }
     if (chunk.attached_cmdbuf.status() == WMTCommandBufferStatusError) {
       last_failed_seq_id.store(internal_seq, std::memory_order_release);
       ERR("Device error at frame ", chunk.frame_, ": ", chunk.attached_cmdbuf.error().description().getUTF8String());

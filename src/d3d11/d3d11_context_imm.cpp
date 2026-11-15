@@ -601,11 +601,15 @@ public:
   };
 
   bool
-  FlushAndWait() override {
+  FlushAndWait(uint64_t *pGpuTime) override {
     uint64_t seq = cmd_queue.CurrentSeqId();
     InvalidateCurrentPass(true);
+    if (pGpuTime)
+      cmd_queue.MeasureGpuTime(seq);
     Commit();
     cmd_queue.WaitCPUFence(seq);
+    if (pGpuTime)
+      *pGpuTime = cmd_queue.MeasuredGpuTime();
     return cmd_queue.LastFailedSeqId() == seq;
   }
 

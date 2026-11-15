@@ -162,6 +162,8 @@ private:
 
   std::atomic_uint64_t ready_for_encode = 1; // we start from 1, so 0 is always coherent
   std::atomic_uint64_t last_failed_seq_id = 0;
+  std::atomic_uint64_t measured_seq_id = 0;
+  std::atomic_uint64_t measured_gpu_time = 0;
   std::atomic_uint64_t ready_for_commit = 1;
   std::atomic_uint64_t chunk_ongoing = 0;
   CpuFence cpu_coherent;
@@ -230,6 +232,20 @@ public:
   uint64_t
   LastFailedSeqId() {
     return last_failed_seq_id.load(std::memory_order_acquire);
+  };
+
+  /**
+  Ask for the GPU time of the command buffer of a chunk that is not committed yet.
+  MeasuredGpuTime() returns it, in nanoseconds, once WaitCPUFence() on that chunk has returned.
+   */
+  void
+  MeasureGpuTime(uint64_t seq) {
+    measured_seq_id.store(seq, std::memory_order_release);
+  };
+
+  uint64_t
+  MeasuredGpuTime() {
+    return measured_gpu_time.load(std::memory_order_acquire);
   };
 
   uint64_t

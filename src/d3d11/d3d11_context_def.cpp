@@ -447,7 +447,7 @@ public:
       // nop
   };
 
-  bool FlushAndWait() override {
+  bool FlushAndWait(uint64_t *) override {
     return false; // never called: draws are not isolated on a deferred context
   }
 

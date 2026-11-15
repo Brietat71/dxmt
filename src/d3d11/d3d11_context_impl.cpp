@@ -21,7 +21,7 @@
  */
 
 #include <algorithm>
-#include <unordered_set>
+#include <unordered_map>
 #include <vector>
 #include "Metal.hpp"
 #include "d3d11_annotation.hpp"
@@ -4390,15 +4390,25 @@ public:
   bool promote_flush = false;
 
   static constexpr uint32_t kIsolatedPassMaxPixelCount = 64 * 64;
+  static constexpr uint64_t kIsolatedPassFastTime = 5'000'000; // ns of GPU time
+  /**
+  What is known about a pixel shader that samples in nested loops, once it has run in an isolated pass.
+  */
+  enum class LongShaderState {
+    Slow, // completed, but slowly: keeps being isolated
+    Fast, // completed quickly: an ordinary shader, never isolated again
+    Hung, // failed on the GPU: not submitted anymore
+  };
   bool isolated_pass_ = false;
   std::vector<ManagedShader> isolated_pass_shaders_;
-  std::unordered_set<ManagedShader> hung_pixel_shaders_;
+  std::unordered_map<ManagedShader, LongShaderState> long_shader_states_;
 
   /**
   Commit the current chunk and wait for it to complete on the GPU.
   Return true if its command buffer ended with an error.
+  If pGpuTime is set, it receives the GPU time of that command buffer, in nanoseconds.
   */
-  virtual bool FlushAndWait() = 0;
+  virtual bool FlushAndWait(uint64_t *pGpuTime = nullptr) = 0;
 
   /**
   Render pass can be invalidated by reasons:
@@ -4980,8 +4990,11 @@ public:
   typically the convolution of an environment probe) are given a chunk of their own, with nothing else in flight.
   If that chunk fails, the shader can't complete on this GPU and is not submitted anymore.
 
-  ponytail: the candidates are found by a structural test, not a cost estimate. Use loop trip counts if a game runs
-  such a shader every frame (each isolated pass costs two GPU synchronizations).
+  The structural test also matches cheap filters that run every frame, and an isolated pass costs two GPU
+  synchronizations: the isolated chunk is timed, and a shader that completes quickly is never isolated again.
+
+  ponytail: the verdict comes from the first run only. Time the following ones too (or bound the cost statically
+  from the loop trip counts) if a shader turns out to be fast or slow depending on its inputs.
 
   Return false if the draw has to be skipped.
   */
@@ -4994,8 +5007,12 @@ public:
     auto PS = GetManagedShader<PipelineStage::Pixel>();
     if (likely(!PS || !PS->reflection().PixelShader.HasNestedSamplingLoop))
       return true;
-    if (hung_pixel_shaders_.contains(PS))
-      return false;
+    if (auto state = long_shader_states_.find(PS); state != long_shader_states_.end()) {
+      if (state->second == LongShaderState::Fast)
+        return true;
+      if (state->second == LongShaderState::Hung)
+        return false;
+    }
     uint32_t pixel_count = state_.OutputMerger.RenderTargetWidth * state_.OutputMerger.RenderTargetHeight;
     if (!pixel_count || pixel_count > kIsolatedPassMaxPixelCount || GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)
       return true;
@@ -5011,10 +5028,14 @@ public:
   void
   EndIsolatedPass() {
     isolated_pass_ = false;
-    if (FlushAndWait()) {
-      for (auto PS : isolated_pass_shaders_) {
-        hung_pixel_shaders_.insert(PS);
+    uint64_t gpu_time = 0;
+    bool failed = FlushAndWait(&gpu_time);
+    for (auto PS : isolated_pass_shaders_) {
+      if (failed) {
+        long_shader_states_[PS] = LongShaderState::Hung;
         WARN("Pixel shader ", PS->sha1().string(), " failed on the GPU when run alone, its draws are now skipped");
+      } else {
+        long_shader_states_[PS] = gpu_time < kIsolatedPassFastTime ? LongShaderState::Fast : LongShaderState::Slow;
       }
     }
     isolated_pass_shaders_.clear();
