@@ -55,6 +55,13 @@ static void InitializeMetalCachePath() {
     return;
   // This is the framework cache (mainly for PSOs), not managed by DXMT
   auto metal_cache_path = str::format("dxmt/", env::getExeName(), "/com.apple.metal");
+  /* neutron: DXMT_SHADER_CACHE_PATH (absolute) holds both caches, the
+     user cache dir under /var/folders can be purged by macOS */
+  if (auto base = env::getEnvVar("DXMT_SHADER_CACHE_PATH"); !base.empty() && base.starts_with("/")) {
+    if (!base.ends_with('/'))
+      base += "/";
+    metal_cache_path = base + "com.apple.metal";
+  }
   if (!WMTSetMetalShaderCachePath(metal_cache_path.c_str())) {
     Logger::info("Failed to set Metal cache path, fallback to system default");
   }
