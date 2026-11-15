@@ -449,7 +449,7 @@ public:
   bindSampler(unsigned slot, Rc<Sampler> sampler) {
     unsigned idx = slot + 16 * unsigned(stage);
     auto &entry = sampler_[idx];
-    entry.sampler = sampler;
+    entry.sampler = std::move(sampler); /* neutron: move, a copy cost two more atomics per bind */
   }
 
   template <PipelineStage stage>

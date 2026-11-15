@@ -6,8 +6,17 @@ namespace dxmt {
 
 class d3d11_device_mutex {
 public:
-  void lock();
-  void unlock() noexcept;
+  /* neutron: inline the check for an unprotected device (the usual case), it runs twice per API call */
+  void lock() {
+    if (protected_)
+      lock_protected();
+  }
+  void unlock() noexcept {
+    if (protected_)
+      unlock_protected();
+  }
+  void lock_protected();
+  void unlock_protected() noexcept;
 
   bool set_protected(bool Protected);
   bool get_protected();

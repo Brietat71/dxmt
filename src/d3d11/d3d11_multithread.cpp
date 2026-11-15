@@ -6,9 +6,7 @@
 
 namespace dxmt {
 
-void d3d11_device_mutex::lock() {
-  if (!protected_)
-    return;
+void d3d11_device_mutex::lock_protected() {
   uint32_t tid = dxmt::this_thread::get_id();
   uint32_t expected = 0;
   while(!owner_.compare_exchange_weak(expected, tid, std::memory_order_acquire)) {
@@ -28,9 +26,7 @@ void d3d11_device_mutex::lock() {
   }
   counter_++;
 }
-void d3d11_device_mutex::unlock() noexcept {
-  if (!protected_)
-    return;
+void d3d11_device_mutex::unlock_protected() noexcept {
   counter_--;
   if (likely(counter_ == 0))
     owner_.store(0, std::memory_order_release);
