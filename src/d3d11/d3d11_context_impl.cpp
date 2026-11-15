@@ -1962,11 +1962,13 @@ public:
   IASetInputLayout(ID3D11InputLayout *pInputLayout) override {
     std::lock_guard<mutex_t> lock(mutex);
 
-    if (auto expected = com_cast<IMTLD3D11InputLayout>(pInputLayout)) {
+    /* neutron: every ID3D11InputLayout of this device is an IMTLD3D11InputLayout (single inheritance), a
+       static cast saves the QueryInterface + AddRef + Release per call; the same goes for the state objects */
+    if (auto expected = static_cast<IMTLD3D11InputLayout *>(pInputLayout)) {
       /* neutron: the same layout again keeps the pipeline (engines set it for every draw) */
-      if (state_.InputAssembler.InputLayout.ptr() == expected.ptr())
+      if (state_.InputAssembler.InputLayout.ptr() == expected)
         return;
-      state_.InputAssembler.InputLayout = std::move(expected);
+      state_.InputAssembler.InputLayout = expected;
     } else {
       if (!state_.InputAssembler.InputLayout)
         return;
@@ -3021,9 +3023,9 @@ public:
     std::lock_guard<mutex_t> lock(mutex);
 
     bool should_invalidate_pipeline = false;
-    if (auto expected = com_cast<IMTLD3D11BlendState>(pBlendState)) {
-      if (expected.ptr() != state_.OutputMerger.BlendState) {
-        state_.OutputMerger.BlendState = expected.ptr();
+    if (auto expected = static_cast<IMTLD3D11BlendState *>(pBlendState)) {
+      if (expected != state_.OutputMerger.BlendState) {
+        state_.OutputMerger.BlendState = expected;
         should_invalidate_pipeline = true;
       }
     } else {
@@ -3072,10 +3074,7 @@ public:
   OMSetDepthStencilState(ID3D11DepthStencilState *pDepthStencilState, UINT StencilRef) override {
     std::lock_guard<mutex_t> lock(mutex);
 
-    IMTLD3D11DepthStencilState *NewState = nullptr;
-    if (auto expected = com_cast<IMTLD3D11DepthStencilState>(pDepthStencilState)) {
-      NewState = expected.ptr();
-    }
+    auto NewState = static_cast<IMTLD3D11DepthStencilState *>(pDepthStencilState);
     /* neutron: the same state and stencil reference again emit no command (a new render pass sets it anyway) */
     if (state_.OutputMerger.DepthStencilState == NewState && state_.OutputMerger.StencilRef == StencilRef)
       return;
@@ -3111,15 +3110,15 @@ public:
     std::lock_guard<mutex_t> lock(mutex);
 
     if (pRasterizerState) {
-      if (auto expected = com_cast<IMTLD3D11RasterizerState>(pRasterizerState)) {
-        if (state_.Rasterizer.RasterizerState == expected.ptr())
+      if (auto expected = static_cast<IMTLD3D11RasterizerState *>(pRasterizerState)) {
+        if (state_.Rasterizer.RasterizerState == expected)
           return;
         auto current_rs =
             state_.Rasterizer.RasterizerState ? state_.Rasterizer.RasterizerState : default_rasterizer_state;
         if (current_rs->IsScissorEnabled() != expected->IsScissorEnabled()) {
           dirty_state.set(DirtyState::Scissors);
         }
-        state_.Rasterizer.RasterizerState = expected.ptr();
+        state_.Rasterizer.RasterizerState = expected;
         dirty_state.set(DirtyState::RasterizerState);
       } else {
         ERR("RSSetState: invalid ID3D11RasterizerState object.");
