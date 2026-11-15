@@ -5,7 +5,7 @@
 #ifndef __AIRCONV_H
 #define __AIRCONV_H
 
-#define AIRCONV_VERSION 27
+#define AIRCONV_VERSION 28
 
 #ifdef __cplusplus
 #include <string>
@@ -105,16 +105,16 @@ struct MTL_GEOMETRY_SHADER_REFLECTION {
  * the vertices of the base layout (up to 64) when the payload has room for them.
  */
 static inline uint32_t SM50GSWarpScale(uint32_t NumVertexOutputElement, uint32_t VerticesPerPrimitive, bool Strip) {
-  return !Strip && VerticesPerPrimitive >= 2 && 16 + 64 * (4 + 16 * NumVertexOutputElement) <= 16256 ? 2 : 1;
+  return !Strip && VerticesPerPrimitive >= 2 && 16 + 128 + 64 * (4 + 16 * NumVertexOutputElement) <= 16256 ? 2 : 1;
 }
 
 /*
- * object payload: 4 header words, one validity word per vertex,
- * then one float4 per vertex output register and vertex
+ * object payload: 4 header words, one validity word per vertex, 32 words for what each primitive
+ * emits, then one float4 per vertex output register and vertex
  */
 static inline uint32_t SM50GSPayloadSize(uint32_t NumVertexOutputElement, uint32_t WarpScale) {
-  uint32_t size = 16 + 32 * WarpScale * (4 + 16 * NumVertexOutputElement);
-  // ponytail: as before, a VS with 32 output registers does not fit (16528 bytes) and overruns the
+  uint32_t size = 16 + 128 + 32 * WarpScale * (4 + 16 * NumVertexOutputElement);
+  // ponytail: as before, a VS with 32 output registers does not fit (16656 bytes) and overruns the
   // payload. Shrink its warp if such a shader ever feeds a GS.
   return size < 16256 ? size : 16256;
 }

@@ -258,6 +258,11 @@ ArgumentEncodingContext::encodeConstantBuffers(const MTL_SHADER_REFLECTION *refl
       cmd.type = WMTRenderCommandSetMeshBufferOffset;
     } else if constexpr (stage == PipelineStage::Geometry) {
       cmd.type = WMTRenderCommandSetMeshBufferOffset;
+      // the object shader runs the counting pass of the GS: it reads the GS tables too
+      auto &object_cmd = encodeRenderCommand<wmtcmd_render_setbufferoffset>();
+      object_cmd.type = WMTRenderCommandSetObjectBufferOffset;
+      object_cmd.offset = getFinalArgumentBufferOffset(offset);
+      object_cmd.index = SM50_BINDING_INDEX_CONSTANT_BUFFER2;
     } else {
       assert(0 && "Not implemented or unreachable");
     }
@@ -446,6 +451,10 @@ ArgumentEncodingContext::encodeShaderResources(
       cmd.type = WMTRenderCommandSetMeshBufferOffset;
     } else if constexpr (stage == PipelineStage::Geometry) {
       cmd.type = WMTRenderCommandSetMeshBufferOffset;
+      auto &object_cmd = encodeRenderCommand<wmtcmd_render_setbufferoffset>();
+      object_cmd.type = WMTRenderCommandSetObjectBufferOffset;
+      object_cmd.offset = getFinalArgumentBufferOffset(offset);
+      object_cmd.index = SM50_BINDING_INDEX_ARGUMENT_TABLE2;
     } else {
       assert(0 && "Not implemented or unreachable");
     }
@@ -1004,10 +1013,9 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       if (data->use_geometry || data->use_tessellation) {
         encoder.setObjectBuffer(gpu_buffer_, 0, SM50_BINDING_INDEX_VERTEX_BUFFER);
         encoder.setObjectBuffer(gpu_buffer_, 0, SM50_BINDING_INDEX_DRAW_ARGUMENTS);
-        if (data->use_tessellation) {
-          encoder.setObjectBuffer(gpu_buffer_, 0, SM50_BINDING_INDEX_CONSTANT_BUFFER2);
-          encoder.setObjectBuffer(gpu_buffer_, 0, SM50_BINDING_INDEX_ARGUMENT_TABLE2);
-        }
+        // second table set of the object stage: the VS of a tessellation pipeline, the GS of a geometry pipeline
+        encoder.setObjectBuffer(gpu_buffer_, 0, SM50_BINDING_INDEX_CONSTANT_BUFFER2);
+        encoder.setObjectBuffer(gpu_buffer_, 0, SM50_BINDING_INDEX_ARGUMENT_TABLE2);
         encoder.setObjectBuffer(gpu_buffer_, 0, SM50_BINDING_INDEX_CONSTANT_BUFFER);
         encoder.setObjectBuffer(gpu_buffer_, 0, SM50_BINDING_INDEX_ARGUMENT_TABLE);
         encoder.setMeshBuffer(gpu_buffer_, 0, SM50_BINDING_INDEX_CONSTANT_BUFFER);
