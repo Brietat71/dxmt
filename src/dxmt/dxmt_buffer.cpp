@@ -172,7 +172,7 @@ Rc<BufferAllocation>
 Buffer::allocate(Flags<BufferAllocationFlag> flags) {
   WMTResourceOptions options = WMTResourceHazardTrackingModeUntracked;
   if (flags.test(BufferAllocationFlag::CpuWriteCombined)) {
-    options |= WMTResourceOptionCPUCacheModeWriteCombined;
+    options |= CpuWriteCombinedOption();
   }
   if (flags.test(BufferAllocationFlag::CpuInvisible)) {
     options |= WMTResourceStorageModePrivate;
@@ -191,7 +191,7 @@ Rc<BufferAllocation>
 Buffer::allocate(Flags<BufferAllocationFlag> flags, WMT::Heap heap, uint64_t heap_offset) {
   WMTResourceOptions options = WMTResourceHazardTrackingModeUntracked;
   if (flags.test(BufferAllocationFlag::CpuWriteCombined)) {
-    options |= WMTResourceOptionCPUCacheModeWriteCombined;
+    options |= CpuWriteCombinedOption();
   }
   if (flags.test(BufferAllocationFlag::CpuInvisible)) {
     options |= WMTResourceStorageModePrivate;

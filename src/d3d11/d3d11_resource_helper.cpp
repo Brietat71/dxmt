@@ -389,7 +389,7 @@ CreateMTLTextureDescriptorInternal(
     break;
   case D3D11_USAGE_DYNAMIC:
     options |=
-        WMTResourceStorageModeShared | WMTResourceCPUCacheModeWriteCombined;
+        WMTResourceStorageModeShared | CpuWriteCombinedOption();
     break;
   case D3D11_USAGE_STAGING:
     options |= WMTResourceStorageModeShared;

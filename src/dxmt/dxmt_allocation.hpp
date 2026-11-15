@@ -20,8 +20,23 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include "winemetal.h"
 
 namespace dxmt {
+
+/* neutron: CPU cache mode for resources the application maps (dynamic buffers and textures).
+   Write-combined memory makes the game's x86_64 stores (translated by FEX) followed by the next
+   call into the ARM64EC DLLs about 4x slower per draw; Apple GPUs are cache coherent, so the
+   default cache mode is correct too. NEUTRON_DXMT_WRITE_COMBINED=1 restores write-combined. */
+inline WMTResourceOptions
+CpuWriteCombinedOption() {
+  static const bool wc = [] {
+    const char *e = getenv("NEUTRON_DXMT_WRITE_COMBINED");
+    return e && *e == '1';
+  }();
+  return wc ? WMTResourceOptionCPUCacheModeWriteCombined : (WMTResourceOptions)0;
+}
 
 class Allocation {
 public:

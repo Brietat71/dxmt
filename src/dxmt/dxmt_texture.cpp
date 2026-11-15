@@ -179,7 +179,7 @@ Texture::allocate(Flags<TextureAllocationFlag> flags) {
   WMTTextureInfo info = info_; // copy
   info.mach_port = 0;
   if (flags.test(TextureAllocationFlag::CpuWriteCombined)) {
-    options |= WMTResourceOptionCPUCacheModeWriteCombined;
+    options |= CpuWriteCombinedOption();
   }
   if (flags.test(TextureAllocationFlag::CpuInvisible)) {
     options |= WMTResourceStorageModePrivate;
@@ -209,7 +209,7 @@ Texture::allocate(Flags<TextureAllocationFlag> flags, WMT::Heap heap, uint64_t h
   WMTTextureInfo info = info_; // copy
   info.mach_port = 0;
   if (flags.test(TextureAllocationFlag::CpuWriteCombined)) {
-    options |= WMTResourceOptionCPUCacheModeWriteCombined;
+    options |= CpuWriteCombinedOption();
   }
   if (flags.test(TextureAllocationFlag::CpuInvisible)) {
     options |= WMTResourceStorageModePrivate;
