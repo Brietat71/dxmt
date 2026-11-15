@@ -113,6 +113,9 @@ private:
     if (auto ptr = (wmtcmd_base *)allocateCpuHeap<T>()) {
       blit_cmd_tail->next.set(ptr);
       blit_cmd_tail = ptr;
+      // The command is linked before its caller fills it in. If a later allocation of the same request fails,
+      // flushInternal() encodes the list as is: without this, the recycled heap bytes of an older command run again.
+      ptr->type = WMTBlitCommandNop;
       ptr->next.set(nullptr);
       *p = (T *)ptr;
       return true;
