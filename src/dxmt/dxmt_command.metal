@@ -437,9 +437,10 @@ struct DXMTGSDispatchMarshal {
     uint count = task.draw_arguments.x;
     uint x = (count - 1) / task.vertex_count_per_warp + 1;
     uint y = task.draw_arguments.y;
-    // instance packing, must match SM50GSInstancesPerWarp()
-    if (task.pack_unit != 0 && count != 0 && count <= task.pack_vertex_per_warp / 2 && count % task.pack_unit == 0)
-      y = (y + task.pack_vertex_per_warp / count - 1) / (task.pack_vertex_per_warp / count);
+    // instance packing, must match SM50GSInstancesPerWarp() and the encoder: (instances - 1) / packed + 1
+    if (y != 0 && task.pack_unit != 0 && count != 0 && count <= task.pack_vertex_per_warp / 2 &&
+        count % task.pack_unit == 0)
+      y = (y - 1) / (task.pack_vertex_per_warp / count) + 1;
     if ((count * task.draw_arguments.y) == 0 ||
         x * y > task.max_object_threadgroups) {
       output.x = 0;
