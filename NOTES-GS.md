@@ -210,6 +210,14 @@ les mesures en jeu passent par la pile arm64.
 
 ### Demandes de mesure (agent arm64)
 
+**Priorité 1 (aucune construction spéciale)** : `perf-gs` étiquette maintenant les encodeurs de rendu (commit `feat(dxmt): label render encoders`,
+intégré automatiquement dans le runtime `gs`). Refaire la **trace Metal en vue dense fixe, profil max**, et donner la sortie complète de
+`parse_gpu.py <export.xml> ""` (les 15 « top libellés » par canal), ou le chemin du `.xml`. Les libellés sont de la forme
+`GS 0c1d 2048x2048x4 c/ dC/S` (passes d'ombre par GS), `R 4c1d 3456x2234x1 cLLLL/SSSS dL/S` (passe principale ; `L` = attachements rechargés).
+C'est ce qui dira si les 8 ms de Vertex et les 16 ms de Fragment viennent des ombres, de la passe principale ou du post-traitement.
+
+Le reste (sonde complète, moins urgent) :
+
 Runtime à construire depuis **`origin/gs-probe2`** (= `perf-gs` + 2 commits d'instrumentation, à ne pas fusionner).
 Il écrit dans `~/code/dxmt-gs-data/probe2/` (chemins codés en dur, rien à configurer) :
 `stats.txt` (toutes les 10 s : `T=<epoch>`, fps, draws/frame, et par paire VS+GS draws, indices, instances, threadgroups object),
@@ -227,6 +235,31 @@ Les encodeurs de rendu sont étiquetés pour la trace Metal : `GS`/`TS`/`R`, nom
 4. **GPU hang** : après un chargement en Élevé, le contenu de `errors.txt` et `errors-encoders.txt`.
    Contre-épreuve : le même chargement en Élevé avec le runtime `fork` (ancien chemin GS) produit-il aussi
    `Device error ... Caused GPU Hang Error` ? (attribution : mon chemin regroupé, ou les passes GS/TS en général).
+
+### Relevé arm64 en profil max (runtime `gs` = `cc3d8a81`, PROGRESS.md 21:36)
+
+| Scène | FPS | GPU ms |
+|---|---|---|
+| Déploiement | 63,5 (min 60) | 15,9, limité GPU |
+| Parcours caméra, 62 s | moy 62, **min 38, p5 41**, médiane 57 | 22-27 dans les vues denses |
+| Vue dense fixe | 51-52 | 17,5 pour un intervalle de 19 ; thread principal 98 % |
+
+Trace Metal en vue dense : **Fragment 15,8 ms + Vertex 8,2 ms + Compute 0,6 ms** de travail GPU par image.
+Cible : intervalle ≤ 16,7 ms. Il manque ~35 % de temps GPU dans les vues denses, et ~20 % sur le thread principal (processeur émulé).
+
+### Où part la géométrie des GS maintenant (banc aux vrais shaders, expériences jetées, GPU au repos)
+
+| Mesure (rastérisation coupée) | A : triangles indexés | B : billboards |
+|---|---|---|
+| Chemin complet | 0,70 ms | 1,88 ms |
+| Étage object seul (aucun mesh threadgroup lancé) | 0,23 ms | 0,29 ms |
+| Mesh threadgroups lancés mais corps du GS sauté | 0,68 ms | 1,87 ms |
+
+- **Le coût restant est un coût fixe par mesh threadgroup** (~13 ns, soit ~0,65 ns par triangle à 20 invocations par threadgroup),
+  pas le travail du GS : sauter tout le corps du GS ne change rien. L'étage object (les VS) pèse 15 à 30 %.
+- Sans effet mesuré : les barrières (banc synthétique, avec ou sans), le nombre de primitives déclaré (160 → 80), un fragment shader vide ou absent.
+- Le nombre d'invocations par mesh threadgroup est borné par la limite Metal de 256 sommets par mesh : 25 au plus pour `maxvertexcount = 9`, 20 aujourd'hui.
+- Conclusion : la géométrie des GS est à ~20 % d'un pipeline vertex natif. Il n'y a plus de facteur 2 à y prendre.
 
 ### Piste « routage par cascade en pipeline vertex » : évaluée, écartée
 
