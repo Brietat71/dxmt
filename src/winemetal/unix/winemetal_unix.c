@@ -106,7 +106,25 @@ _NSAutoreleasePool_alloc_init(void *obj) {
 static NTSTATUS
 _MTLCommandQueue_commandBuffer(void *obj) {
   struct unixcall_generic_obj_obj_ret *params = obj;
-  params->ret = (obj_handle_t)[(id<MTLCommandQueue>)params->handle commandBuffer];
+  // sonde : état d'exécution par encodeur, pour savoir lequel a fauté quand un tampon échoue (GPU hang...)
+  MTLCommandBufferDescriptor *desc = [[MTLCommandBufferDescriptor alloc] init];
+  desc.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+  id<MTLCommandBuffer> cmdbuf = [(id<MTLCommandQueue>)params->handle commandBufferWithDescriptor:desc];
+  [desc release];
+  [cmdbuf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+    if (!cb.error)
+      return;
+    FILE *f = fopen("/Users/brintet/code/dxmt-gs-data/probe2/errors-encoders.txt", "a");
+    if (!f)
+      return;
+    fprintf(f, "%ld %s\n", (long)time(NULL), cb.error.localizedDescription.UTF8String);
+    NSArray<id<MTLCommandBufferEncoderInfo>> *infos = cb.error.userInfo[MTLCommandBufferEncoderInfoErrorKey];
+    // 0 inconnu, 1 terminé, 2 affecté, 3 en attente, 4 fautif
+    for (id<MTLCommandBufferEncoderInfo> info in infos)
+      fprintf(f, "  etat=%ld %s\n", (long)info.errorState, info.label.UTF8String);
+    fclose(f);
+  }];
+  params->ret = (obj_handle_t)cmdbuf;
   return STATUS_SUCCESS;
 }
 
