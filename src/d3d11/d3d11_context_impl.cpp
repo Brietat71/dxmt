@@ -1536,6 +1536,18 @@ public:
     });
   }
 
+  /**
+  Layout of the current geometry draw, see airconv_public.h:
+  threads per mesh threadgroup, and the instance packing unit (0 for strips: no packing)
+  */
+  std::pair<uint32_t, uint32_t>
+  GetGeometryDrawLayout() {
+    auto &gs = GetManagedShader<PipelineStage::Geometry>()->reflection().GeometryShader;
+    if (is_strip_topology(state_.InputAssembler.Topology))
+      return {gs.MeshThreadsStrip, 0};
+    return {gs.MeshThreadsList, gs.VerticesPerPrimitive};
+  }
+
   void
   GeometryDraw(
       UINT VertexCountPerInstance, UINT InstanceCount, UINT StartVertexLocation,
@@ -1543,6 +1555,7 @@ public:
   ) {
     auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_ARGUMENTS), 32);
     auto max_object_threadgroups = max_object_threadgroups_;
+    auto [mesh_threads, pack_unit] = GetGeometryDrawLayout();
     EmitOP([=, topo = state_.InputAssembler.Topology](ArgumentEncodingContext &enc) {
       DXMT_DRAW_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(draw_arguments_offset);
       draw_argument->StartVertex = StartVertexLocation;
@@ -1552,9 +1565,12 @@ public:
 
       auto [vertex_per_warp, vertex_increment_per_wrap] = get_gs_vertex_count(topo);
       auto warp_count = (VertexCountPerInstance - 1) / vertex_increment_per_wrap + 1;
+      // several instances per warp for a small instanced draw: the object shader maps thread -> (instance, vertex)
+      auto instance_group_count =
+          (InstanceCount - 1) / SM50GSInstancesPerWarp(VertexCountPerInstance, vertex_per_warp, pack_unit) + 1;
 
-      if (warp_count * InstanceCount > max_object_threadgroups) {
-        WARN("Omitted mesh draw (GS) because of too many object threadgroups(", warp_count, "x", InstanceCount, ")");
+      if (warp_count * instance_group_count > max_object_threadgroups) {
+        WARN("Omitted mesh draw (GS) because of too many object threadgroups(", warp_count, "x", instance_group_count, ")");
         return;
       }
 
@@ -1563,9 +1579,10 @@ public:
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw>();
       cmd.type = WMTRenderCommandDXMTGeometryDraw;
       cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(draw_arguments_offset);
-      cmd.instance_count = InstanceCount;
+      cmd.instance_count = instance_group_count;
       cmd.warp_count = warp_count;
       cmd.vertex_per_warp = vertex_per_warp;
+      cmd.mesh_threads = mesh_threads;
     });
   }
 
@@ -1577,6 +1594,7 @@ public:
     auto IndexBufferOffset = state_.InputAssembler.IndexBufferOffset;
     auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_INDEXED_ARGUMENTS), 32);
     auto max_object_threadgroups = max_object_threadgroups_;
+    auto [mesh_threads, pack_unit] = GetGeometryDrawLayout();
     EmitOP([=, topo = state_.InputAssembler.Topology](ArgumentEncodingContext &enc) {
       DXMT_DRAW_INDEXED_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(draw_arguments_offset);
       draw_argument->BaseVertex = BaseVertexLocation;
@@ -1588,9 +1606,11 @@ public:
       auto [index_buffer, index_sub_offset] = enc.currentIndexBuffer();
       auto [vertex_per_warp, vertex_increment_per_wrap] = get_gs_vertex_count(topo);
       auto warp_count = (IndexCountPerInstance - 1) / vertex_increment_per_wrap + 1;
+      auto instance_group_count =
+          (InstanceCount - 1) / SM50GSInstancesPerWarp(IndexCountPerInstance, vertex_per_warp, pack_unit) + 1;
 
-      if (warp_count * InstanceCount > max_object_threadgroups) {
-        WARN("Omitted mesh draw (GS) because of too many object threadgroups(", warp_count, "x", InstanceCount, ")");
+      if (warp_count * instance_group_count > max_object_threadgroups) {
+        WARN("Omitted mesh draw (GS) because of too many object threadgroups(", warp_count, "x", instance_group_count, ")");
         return;
       }
 
@@ -1599,9 +1619,10 @@ public:
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw_indexed>();
       cmd.type = WMTRenderCommandDXMTGeometryDrawIndexed;
       cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(draw_arguments_offset);
-      cmd.instance_count = InstanceCount;
+      cmd.instance_count = instance_group_count;
       cmd.warp_count = warp_count;
       cmd.vertex_per_warp = vertex_per_warp;
+      cmd.mesh_threads = mesh_threads;
       cmd.index_buffer = index_buffer;
       cmd.index_buffer_offset = IndexBufferOffset + index_sub_offset;
     });
@@ -1688,6 +1709,7 @@ public:
     ID3D11Buffer *pBufferForArgs, UINT AlignedByteOffsetForArgs
   ) {
     auto max_object_threadgroups = max_object_threadgroups_;
+    auto [mesh_threads, pack_unit] = GetGeometryDrawLayout();
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
       EmitOP([=, topo = state_.InputAssembler.Topology, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
@@ -1700,7 +1722,8 @@ public:
         enc.bumpVisibilityResultOffset();
         enc.encodeGSDispatchArgumentsMarshal(
           buffer->buffer(), buffer->gpuAddress() + buffer_offset, AlignedByteOffsetForArgs, vertex_increment_per_wrap,
-          dispatch_arg.gpu_buffer, dispatch_arg.gpu_address, dispatch_arg.offset, max_object_threadgroups
+          dispatch_arg.gpu_buffer, dispatch_arg.gpu_address, dispatch_arg.offset, max_object_threadgroups,
+          vertex_per_warp, pack_unit
         );
         enc.resolveRenderPassBarrier();
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw_indirect>();
@@ -1708,6 +1731,7 @@ public:
         cmd.dispatch_args_buffer = dispatch_arg.gpu_buffer;
         cmd.dispatch_args_offset = dispatch_arg.offset;
         cmd.vertex_per_warp = vertex_per_warp;
+        cmd.mesh_threads = mesh_threads;
         cmd.indirect_args_buffer = buffer->buffer();
         cmd.indirect_args_offset = buffer_offset + AlignedByteOffsetForArgs;
         cmd.imm_draw_arguments = enc.getFinalArgumentBuffer();
@@ -1721,6 +1745,7 @@ public:
   ) {
     auto IndexBufferOffset = state_.InputAssembler.IndexBufferOffset;
     auto max_object_threadgroups = max_object_threadgroups_;
+    auto [mesh_threads, pack_unit] = GetGeometryDrawLayout();
 
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
       EmitOP([=, topo = state_.InputAssembler.Topology, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
@@ -1735,7 +1760,8 @@ public:
         enc.bumpVisibilityResultOffset();
         enc.encodeGSDispatchArgumentsMarshal(
           buffer->buffer(), buffer->gpuAddress() + buffer_offset, AlignedByteOffsetForArgs, vertex_increment_per_wrap,
-          dispatch_arg.gpu_buffer, dispatch_arg.gpu_address, dispatch_arg.offset, max_object_threadgroups
+          dispatch_arg.gpu_buffer, dispatch_arg.gpu_address, dispatch_arg.offset, max_object_threadgroups,
+          vertex_per_warp, pack_unit
         );
         enc.resolveRenderPassBarrier();
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw_indexed_indirect>();
@@ -1743,6 +1769,7 @@ public:
         cmd.dispatch_args_buffer = dispatch_arg.gpu_buffer;
         cmd.dispatch_args_offset = dispatch_arg.offset;
         cmd.vertex_per_warp = vertex_per_warp;
+        cmd.mesh_threads = mesh_threads;
         cmd.indirect_args_buffer = buffer->buffer();
         cmd.indirect_args_offset = AlignedByteOffsetForArgs + buffer_offset;
         cmd.index_buffer = index_buffer;

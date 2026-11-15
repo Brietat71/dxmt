@@ -33,7 +33,8 @@ public:
         depth_stencil_format(pDesc->DepthStencilFormat), device_(pDevice),
         pBlendState(pDesc->BlendState),
         RasterizationEnabled(pDesc->RasterizationEnabled),
-        SampleCount(pDesc->SampleCount) {
+        SampleCount(pDesc->SampleCount),
+        PayloadSize(SM50GSPayloadSize(pDesc->VertexShader->reflection().NumOutputElement)) {
     if (pDesc->RasterizationEnabled && !pDesc->PixelShader)
       num_rtvs = 0;
     uint32_t unorm_output_reg_mask = 0;
@@ -101,7 +102,7 @@ public:
 
     info.object_function = vs.Function;
     info.mesh_function = gs.Function;
-    info.payload_memory_length = 16256;
+    info.payload_memory_length = PayloadSize;
 
     info.immutable_object_buffers = (1 << 16)  | (1 << 21) | (1 << 29) | (1 << 30);
     info.immutable_mesh_buffers = (1 << 29) | (1 << 30);
@@ -158,6 +159,7 @@ private:
   WMT::Reference<WMT::RenderPipelineState> state_mesh_;
   bool RasterizationEnabled;
   UINT SampleCount;
+  UINT PayloadSize;
 
   CompiledShader *VertexShader;
   CompiledShader *PixelShader;

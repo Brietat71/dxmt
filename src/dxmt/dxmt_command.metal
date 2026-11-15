@@ -421,6 +421,8 @@ struct DXMTGSDispatchMarshal {
   ulong max_object_threadgroups;
   uint vertex_count_per_warp;
   uint end_of_command;
+  uint pack_vertex_per_warp;
+  uint pack_unit;
 };
 
 [[vertex]] void gs_draw_arguments_marshal(
@@ -432,15 +434,20 @@ struct DXMTGSDispatchMarshal {
 
     device DXMTDispatchArguments& output = task.dispatch_arguments_out;
 
-    uint x = (task.draw_arguments.x - 1) / task.vertex_count_per_warp + 1;
-    if ((task.draw_arguments.x * task.draw_arguments.y) == 0 ||
-        x * task.draw_arguments.y > task.max_object_threadgroups) {
+    uint count = task.draw_arguments.x;
+    uint x = (count - 1) / task.vertex_count_per_warp + 1;
+    uint y = task.draw_arguments.y;
+    // instance packing, must match SM50GSInstancesPerWarp()
+    if (task.pack_unit != 0 && count != 0 && count <= task.pack_vertex_per_warp / 2 && count % task.pack_unit == 0)
+      y = (y + task.pack_vertex_per_warp / count - 1) / (task.pack_vertex_per_warp / count);
+    if ((count * task.draw_arguments.y) == 0 ||
+        x * y > task.max_object_threadgroups) {
       output.x = 0;
       output.y = 0;
       output.z = 0;
     } else {
       output.x = x;
-      output.y = task.draw_arguments.y;
+      output.y = y;
       output.z = 1;
     }
 

@@ -137,6 +137,8 @@ struct GSDispatchArgumentsMarshal {
   WMT::Buffer dispatch_arguments_buffer;
   uint64_t dispatch_arguments_va;
   uint32_t vertex_count_per_warp;
+  uint32_t pack_vertex_per_warp;
+  uint32_t pack_unit;
 };
 
 struct TSDispatchArgumentsMarshal {
@@ -611,13 +613,14 @@ public:
   void
   encodeGSDispatchArgumentsMarshal(
       WMT::Buffer draw_args, uint64_t draw_args_resource_id, uint32_t draw_args_offset, uint32_t vertex_count_per_warp,
-      WMT::Buffer dispatch_args, uint64_t dispatch_args_resource_id, uint32_t write_offset, uint64_t max_object_threadgroups
+      WMT::Buffer dispatch_args, uint64_t dispatch_args_resource_id, uint32_t write_offset, uint64_t max_object_threadgroups,
+      uint32_t pack_vertex_per_warp, uint32_t pack_unit
   ) {
     assert(encoder_current->type == EncoderType::Render);
     auto data = static_cast<RenderEncoderData *>(encoder_current);
     data->gs_arg_marshal_tasks.push_back(
         {draw_args, draw_args_resource_id + draw_args_offset, max_object_threadgroups, dispatch_args,
-         dispatch_args_resource_id + write_offset, vertex_count_per_warp}
+         dispatch_args_resource_id + write_offset, vertex_count_per_warp, pack_vertex_per_warp, pack_unit}
     );
   }
 

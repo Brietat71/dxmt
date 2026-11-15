@@ -1221,6 +1221,10 @@ initialize(
     case microsoft::D3D10_SB_GEOMETRY_SHADER:
       pRefl->GeometryShader.GSPassThrough = ~0u;
       pRefl->GeometryShader.Primitive = shader->gs_input_primitive;
+      pRefl->GeometryShader.MeshThreadsList = dxbc::gs_mesh_threads(shader.get(), false);
+      pRefl->GeometryShader.MeshThreadsStrip = dxbc::gs_mesh_threads(shader.get(), true);
+      pRefl->GeometryShader.VerticesPerPrimitive =
+          std::get<2>(dxbc::get_vertex_primitive_count_in_warp(shader->gs_input_primitive, false));
       break;
     case microsoft::D3D11_SB_HULL_SHADER: {
       auto threads_per_patch = next_pow2(shader->hull_maximum_threads_per_patch);
