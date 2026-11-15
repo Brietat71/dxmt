@@ -1221,8 +1221,9 @@ initialize(
     case microsoft::D3D10_SB_GEOMETRY_SHADER:
       pRefl->GeometryShader.GSPassThrough = ~0u;
       pRefl->GeometryShader.Primitive = shader->gs_input_primitive;
-      pRefl->GeometryShader.MeshThreadsList = dxbc::gs_mesh_threads(shader.get(), false);
-      pRefl->GeometryShader.MeshThreadsStrip = dxbc::gs_mesh_threads(shader.get(), true);
+      pRefl->GeometryShader.MeshThreadsLimit = dxbc::gs_mesh_threads_limit(shader.get());
+      pRefl->GeometryShader.PrimitivesPerWarpStrip =
+          std::get<1>(dxbc::get_vertex_primitive_count_in_warp(shader->gs_input_primitive, true));
       pRefl->GeometryShader.VerticesPerPrimitive =
           std::get<2>(dxbc::get_vertex_primitive_count_in_warp(shader->gs_input_primitive, false));
       break;

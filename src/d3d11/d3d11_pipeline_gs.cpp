@@ -34,7 +34,13 @@ public:
         pBlendState(pDesc->BlendState),
         RasterizationEnabled(pDesc->RasterizationEnabled),
         SampleCount(pDesc->SampleCount),
-        PayloadSize(SM50GSPayloadSize(pDesc->VertexShader->reflection().NumOutputElement)) {
+        PayloadSize(SM50GSPayloadSize(
+            pDesc->VertexShader->reflection().NumOutputElement,
+            SM50GSWarpScale(
+                pDesc->VertexShader->reflection().NumOutputElement,
+                pDesc->GeometryShader->reflection().GeometryShader.VerticesPerPrimitive, pDesc->GSStripTopology
+            )
+        )) {
     if (pDesc->RasterizationEnabled && !pDesc->PixelShader)
       num_rtvs = 0;
     uint32_t unorm_output_reg_mask = 0;

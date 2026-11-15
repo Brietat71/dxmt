@@ -4,8 +4,10 @@
 #include <metal_stdlib>
 using namespace metal;
 
+#ifndef WARP_V
 #define WARP_V 30
-#define WARP_P 10
+#endif
+#define WARP_P (WARP_V / 3)
 #define GS_MAXV 9
 
 struct Payload { uint hdr[4]; float4 v[WARP_V * NREG]; uint pad[PAYLOAD_WORDS - 4 - WARP_V * NREG * 4]; };
@@ -33,8 +35,10 @@ using Mesh = mesh<VOut, POut, MAXV, MAXP, topology::triangle>;
                     const device ushort *ib [[buffer(0)]], const device packed_float3 *vb [[buffer(1)]],
                     constant DrawArgs &da [[buffer(2)]], const device float4 *inst [[buffer(3)]],
                     constant Uni &u [[buffer(4)]]) {
+#if WARP_V <= 32
   threadgroup atomic_uint valid;
   atomic_fetch_and_explicit(&valid, 0u, memory_order_relaxed);
+#endif
   uint iid = tg.y, gidx = tg.x * WARP_V + tid;
   bool ok = gidx < da.indexCount;
 #if PACK
@@ -54,13 +58,28 @@ using Mesh = mesh<VOut, POut, MAXV, MAXP, topology::triangle>;
 #if NREG == 2
     p.v[tid * NREG + 1] = float4(pos.xy, 0, 0);
 #endif
+#if WARP_V <= 32
     atomic_fetch_or_explicit(&valid, 1u << tid, memory_order_relaxed);
+#endif
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (tid == 0) {
+#if WARP_V <= 32
     uint vm = atomic_load_explicit(&valid, memory_order_relaxed), pm = 0;
     for (uint i = 0; i < WARP_P; i++)
       pm |= uint(((vm >> (3 * i)) & 7u) == 7u) << i;
+#else
+    // expérience « grand warp » : seulement le cas paquets d'instances, validité par instance
+    uint pm = 0;
+    if (da.indexCount <= WARP_V / 2) {   // paquets d'instances : validité par instance
+      uint kk = WARP_V / da.indexCount, ppi = da.indexCount / 3;
+      for (uint i = 0; i < WARP_P; i++)
+        pm |= uint(i / ppi < kk && tg.y * kk + i / ppi < da.instanceCount) << i;
+    } else {
+      for (uint i = 0; i < WARP_P; i++)
+        pm |= uint(tg.x * WARP_V + 3 * i + 2 < da.indexCount) << i;
+    }
+#endif
     p.hdr[0] = iid; p.hdr[1] = pm; p.hdr[2] = tg.x;
 #if MESH_MODE == 0
     grid.set_threadgroups_per_grid(uint3(WARP_P, 1, 1));

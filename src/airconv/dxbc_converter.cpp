@@ -1248,8 +1248,9 @@ AIRCONV_API int SM50Initialize(
         pRefl->GeometryShader.GSPassThrough = ~0u;
       }
       pRefl->GeometryShader.Primitive = sm50_shader->gs_input_primitive;
-      pRefl->GeometryShader.MeshThreadsList = gs_mesh_threads(sm50_shader.get(), false);
-      pRefl->GeometryShader.MeshThreadsStrip = gs_mesh_threads(sm50_shader.get(), true);
+      pRefl->GeometryShader.MeshThreadsLimit = gs_mesh_threads_limit(sm50_shader.get());
+      pRefl->GeometryShader.PrimitivesPerWarpStrip =
+          std::get<1>(get_vertex_primitive_count_in_warp(sm50_shader->gs_input_primitive, true));
       pRefl->GeometryShader.VerticesPerPrimitive =
           std::get<2>(get_vertex_primitive_count_in_warp(sm50_shader->gs_input_primitive, false));
     }
