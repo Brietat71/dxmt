@@ -215,7 +215,8 @@ Il écrit dans `~/code/dxmt-gs-data/probe2/` (chemins codés en dur, rien à con
 `stats.txt` (toutes les 10 s : `T=<epoch>`, fps, draws/frame, et par paire VS+GS draws, indices, instances, threadgroups object),
 `pairs.txt` + `<sha1>.cso` (pipelines GS créés), `errors.txt` (erreurs de command buffer et numéro de frame),
 `errors-encoders.txt` (encodeurs du tampon fautif : `etat=4` = fautif, avec son étiquette).
-Les encodeurs de rendu sont étiquetés pour la trace Metal : `GS`/`TS`/`R`, nombre de couleurs, profondeur, taille (ex. `GS 0c1d 2048x2048x4`).
+Les encodeurs de rendu sont étiquetés pour la trace Metal : `GS`/`TS`/`R`, nombre de couleurs, profondeur, taille, actions de chargement/stockage
+(ex. `GS 0c1d 2048x2048x4 c/ dC/S` ; `L` = attachement rechargé, donc passe coupée). Branche à `54fd47a3`.
 
 1. **Vue dense fixe, profil max, Shaders Élevé.** Hesse → Lancer partie → x4 60 s → x1 → début du parcours
    (zoom avant 6 crans, défilement droite 7 s, haut 7 s), puis **caméra arrêtée ≥ 40 s**. Dans cette vue :
