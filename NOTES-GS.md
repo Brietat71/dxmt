@@ -257,6 +257,55 @@ Les encodeurs de rendu sont étiquetés pour la trace Metal : `GS`/`TS`/`R`, nom
 Trace Metal en vue dense : **Fragment 15,8 ms + Vertex 8,2 ms + Compute 0,6 ms** de travail GPU par image.
 Cible : intervalle ≤ 16,7 ms. Il manque ~35 % de temps GPU dans les vues denses, et ~20 % sur le thread principal (processeur émulé).
 
+### Lecture de la trace étiquetée en vue dense (`~/code/arm64-wine/traces/max-dense-gs-labeled.xml`, 149 images, 22,2 ms d'intervalle)
+
+Analyse hors jeu, script jetable sur l'export (`start`, `duration`, `encoder-id`). Trois constats.
+
+**1. Les passes 512×512 « à 2,2 ms » et 32×64 « à 0,7 ms » sont un artefact d'attribution, pas un coût.**
+La durée d'un intervalle court de sa mise en file à sa fin. Le canal Fragment est une file : la passe 512×512 est soumise pendant le fragment
+de la passe principale et se termine juste après lui (début 49,47 ms, fin 53,88 ms = fin de la passe principale). En temps **exclusif**
+(fin moins la plus tardive de : son début, la fin de l'intervalle précédent du canal), par image :
+
+| Passe | Vertex | Fragment |
+|---|---|---|
+| Principale `R 3c1d 3456x2234 cLLL/SSS dL/S` | 2,95 | 5,42 |
+| **Ombres par GS** `GS 0c1d 2048x2048x4` | **3,80** | **2,55** |
+| Post-traitement plein écran (10,8 passes `R 1c0d 3456x2234 cL/S`) | 0,12 | 1,77 |
+| `R 1c0d 32x64` + `R 1c0d 1024x1024 cC/S` (soumises ensemble, 1,1 ms à deux) | | 1,33 |
+| `R 1c1d 3456x2234 cL/S dL/S` (4,9 passes) | | 0,84 |
+| Terrain tessellé `TS 3c1d 3456x2234 cCCC/SSS dC/S` | 0,42 | 0,63 |
+| Atlas 4096×2048 (3 passes) | 0,58 | 0,64 |
+| `R 1c0d 512x512` | | ~0 |
+| Total des canaux | 8,61 | 15,2 (+ Compute 0,81) |
+
+GPU occupé (union de tous les intervalles) : **21,9 ms sur 22,2 par image, 98 %**. Il n'y a pas de temps mort à récupérer entre encodeurs.
+
+**2. L'image est une chaîne presque entièrement sérielle, imposée par le jeu.** Ordre observé (image 75, ms depuis le début de son travail GPU) :
+
+| Début | Durée | Étape | Pendant ce temps |
+|---|---|---|---|
+| 0,0 | 3,0 | atlas, chaînes de mips, terrain tessellé | |
+| 3,0 | 3,0 | **Vertex** passe principale | cœurs fragment presque inoccupés |
+| 6,0 | 5,35 | **Fragment** passe principale | canal vertex inoccupé (0,3 ms de petites passes) |
+| 11,3 | 0,4 | chaîne de réduction 1728×1117 → 1×1, puis `Compute Command 88` | |
+| 11,7 | 4,0 | **Vertex** ombres par GS | **cœurs fragment inoccupés** |
+| 15,7 | 2,6 | **Fragment** ombres par GS | canal vertex inoccupé |
+| 18,3 | 4,0 | post-traitement (≈ 45 passes) | |
+
+- Le vertex des ombres ne démarre qu'à la fin de `Compute Command 88`, qui suit la réduction de la profondeur de la passe principale :
+  les cascades sont ajustées à la profondeur de l'image courante (le GS lit leurs bornes dans un buffer d'entiers). L'ordre
+  « fragment principal → réduction → compute → ombres » vient du jeu ; DXMT ne peut pas faire chevaucher les ombres et la passe principale.
+- **Pour l'anomalie « état Medium »** (agent arm64) : le GPU est « occupé » 98 % du temps, mais pendant 7 des 22 ms seule la géométrie travaille
+  (vertex principal 3,0 + vertex des ombres 4,0), et le vertex des ombres est borné par un coût fixe par mesh threadgroup, pas par le calcul.
+  Occupation réelle des cœurs faible sur un tiers de l'image : c'est cohérent avec un régulateur qui ne monte pas. Je n'ai rien vu dans DXMT qui
+  attende entre deux encodeurs (146 encodeurs dans un seul command buffer par image, exécutés dos à dos).
+
+**3. La coupure de la passe principale ne vient pas de la tessellation.** Ordre des encodeurs : `TS 3c1d` (terrain, n° 70), puis
+**`R 1c0d 3456x2234 cL/S` (n° 71, 0,08 ms)**, puis `R 3c1d … cLLL/SSS dL/S` (n° 72, tout le reste). Le jeu change de cible entre le terrain et les objets
+pour une petite passe plein écran sur une autre texture, puis revient au G-buffer : D3D11 impose de stocker puis de recharger.
+DXMT ne peut fusionner 70 et 72 que si 71 peut passer avant ou après les deux, donc s'il ne lit pas le G-buffer et n'est pas lu par la suite.
+À vérifier en jeu (quelles textures lit le n° 71) avant d'espérer quoi que ce soit ; le gain serait un stockage et un rechargement de 4 attachements.
+
 ### Où part la géométrie des GS maintenant (banc aux vrais shaders, expériences jetées, GPU au repos)
 
 | Mesure (rastérisation coupée) | A : triangles indexés | B : billboards |
