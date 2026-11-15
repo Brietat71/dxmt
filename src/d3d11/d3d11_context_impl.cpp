@@ -44,6 +44,10 @@
 #include "util_flags.hpp"
 #include "util_math.hpp"
 #include "util_win32_compat.h"
+#include "util_env.hpp"
+#include <chrono>
+#include <mutex>
+#include <unordered_map>
 
 namespace dxmt {
 
@@ -169,6 +173,41 @@ to_metal_primitive_topology(D3D11_PRIMITIVE_TOPOLOGY topo) {
     D3D11_ASSERT(0 && "Invalid topology");
   }
   return WMTPrimitiveTopologyClassUnspecified;
+}
+
+/**
+DXMT_DEBUG_GS_STATS=1: every 10 seconds, log what went through the geometry shader path, per VS+GS pair:
+draws, vertices (count x instances), instances and object threadgroups per second.
+*/
+inline void
+LogGeometryDrawStats(ManagedShader vs, ManagedShader gs, uint64_t count, uint64_t instances, uint64_t object_tg) {
+  struct Stat {
+    uint64_t draws = 0, vertices = 0, instances = 0, object_tg = 0;
+    ManagedShader vs = nullptr, gs = nullptr;
+  };
+  static std::mutex mutex;
+  static std::unordered_map<uint64_t, Stat> stats;
+  static auto last = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lock(mutex);
+  auto &stat = stats[(uint64_t)(uintptr_t)vs * 31 + (uint64_t)(uintptr_t)gs];
+  stat.vs = vs;
+  stat.gs = gs;
+  stat.draws++;
+  stat.vertices += count * instances;
+  stat.instances += instances;
+  stat.object_tg += object_tg;
+  auto now = std::chrono::steady_clock::now();
+  if (now - last < std::chrono::seconds(10))
+    return;
+  double dt = std::chrono::duration<double>(now - last).count();
+  for (auto &[key, v] : stats)
+    Logger::info(str::format(
+        "gs stats: vs ", v.vs->sha1().string().substr(0, 12), " gs ", v.gs->sha1().string().substr(0, 12), " draws/s ",
+        uint64_t(v.draws / dt), " vertices/s ", uint64_t(v.vertices / dt), " instances/draw ", v.instances / v.draws,
+        " object_tg/s ", uint64_t(v.object_tg / dt)
+    ));
+  stats.clear();
+  last = now;
 }
 
 inline bool is_strip_topology(D3D11_PRIMITIVE_TOPOLOGY topo) {
@@ -1539,6 +1578,49 @@ public:
     });
   }
 
+  struct GeometryDrawLayout {
+    uint32_t vertex_per_warp;           // threads per object threadgroup
+    uint32_t vertex_increment_per_warp;
+    uint32_t mesh_threads;              // GS invocations (threads) per mesh threadgroup
+    uint32_t pack_unit;                 // instance packing unit, 0 for strips: no packing
+  };
+
+  /**
+  Layout of the current geometry draw. It must match what the converter
+  compiled in the object and mesh shaders, see airconv_public.h
+  */
+  GeometryDrawLayout
+  GetGeometryDrawLayout() {
+    auto &gs = GetManagedShader<PipelineStage::Geometry>()->reflection().GeometryShader;
+    auto topo = state_.InputAssembler.Topology;
+    bool strip = is_strip_topology(topo);
+    auto scale = SM50GSWarpScale(
+        GetManagedShader<PipelineStage::Vertex>()->reflection().NumOutputElement, gs.VerticesPerPrimitive, strip
+    );
+    auto [vertex_per_warp, vertex_increment_per_warp] = get_gs_vertex_count(topo);
+    vertex_per_warp *= scale;
+    vertex_increment_per_warp *= scale;
+    uint32_t primitive_per_warp =
+        strip ? gs.PrimitivesPerWarpStrip : vertex_per_warp / std::max<uint32_t>(gs.VerticesPerPrimitive, 1);
+    return {
+        vertex_per_warp, vertex_increment_per_warp,
+        std::clamp<uint32_t>(gs.MeshThreadsLimit, 1, std::max<uint32_t>(primitive_per_warp, 1)),
+        strip ? 0u : gs.VerticesPerPrimitive
+    };
+  }
+
+  void
+  LogGeometryDraw(UINT Count, UINT InstanceCount, const GeometryDrawLayout &layout) {
+    static const bool enabled = !env::getEnvVar("DXMT_DEBUG_GS_STATS").empty();
+    if (likely(!enabled))
+      return;
+    LogGeometryDrawStats(
+        GetManagedShader<PipelineStage::Vertex>(), GetManagedShader<PipelineStage::Geometry>(), Count, InstanceCount,
+        uint64_t((Count - 1) / layout.vertex_increment_per_warp + 1) *
+            ((InstanceCount - 1) / SM50GSInstancesPerWarp(Count, layout.vertex_per_warp, layout.pack_unit) + 1)
+    );
+  }
+
   void
   GeometryDraw(
       UINT VertexCountPerInstance, UINT InstanceCount, UINT StartVertexLocation,
@@ -1546,18 +1628,24 @@ public:
   ) {
     auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_ARGUMENTS), 32);
     auto max_object_threadgroups = max_object_threadgroups_;
-    EmitOP([=, topo = state_.InputAssembler.Topology](ArgumentEncodingContext &enc) {
+    auto layout = GetGeometryDrawLayout();
+    LogGeometryDraw(VertexCountPerInstance, InstanceCount, layout);
+    EmitOP([=](ArgumentEncodingContext &enc) {
       DXMT_DRAW_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(draw_arguments_offset);
       draw_argument->StartVertex = StartVertexLocation;
       draw_argument->VertexCount = VertexCountPerInstance;
       draw_argument->InstanceCount = InstanceCount;
       draw_argument->StartInstance = StartInstanceLocation;
 
-      auto [vertex_per_warp, vertex_increment_per_wrap] = get_gs_vertex_count(topo);
-      auto warp_count = (VertexCountPerInstance - 1) / vertex_increment_per_wrap + 1;
+      auto warp_count = (VertexCountPerInstance - 1) / layout.vertex_increment_per_warp + 1;
+      // several instances per warp for a small instanced draw: the object shader maps thread -> (instance, vertex)
+      auto instance_group_count =
+          (InstanceCount - 1) /
+              SM50GSInstancesPerWarp(VertexCountPerInstance, layout.vertex_per_warp, layout.pack_unit) +
+          1;
 
-      if (warp_count * InstanceCount > max_object_threadgroups) {
-        WARN("Omitted mesh draw (GS) because of too many object threadgroups(", warp_count, "x", InstanceCount, ")");
+      if (warp_count * instance_group_count > max_object_threadgroups) {
+        WARN("Omitted mesh draw (GS) because of too many object threadgroups(", warp_count, "x", instance_group_count, ")");
         return;
       }
 
@@ -1566,9 +1654,10 @@ public:
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw>();
       cmd.type = WMTRenderCommandDXMTGeometryDraw;
       cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(draw_arguments_offset);
-      cmd.instance_count = InstanceCount;
+      cmd.instance_count = instance_group_count;
       cmd.warp_count = warp_count;
-      cmd.vertex_per_warp = vertex_per_warp;
+      cmd.vertex_per_warp = layout.vertex_per_warp;
+      cmd.mesh_threads = layout.mesh_threads;
     });
   }
 
@@ -1580,7 +1669,9 @@ public:
     auto IndexBufferOffset = state_.InputAssembler.IndexBufferOffset;
     auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_INDEXED_ARGUMENTS), 32);
     auto max_object_threadgroups = max_object_threadgroups_;
-    EmitOP([=, topo = state_.InputAssembler.Topology](ArgumentEncodingContext &enc) {
+    auto layout = GetGeometryDrawLayout();
+    LogGeometryDraw(IndexCountPerInstance, InstanceCount, layout);
+    EmitOP([=](ArgumentEncodingContext &enc) {
       DXMT_DRAW_INDEXED_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(draw_arguments_offset);
       draw_argument->BaseVertex = BaseVertexLocation;
       draw_argument->IndexCount = IndexCountPerInstance;
@@ -1589,11 +1680,14 @@ public:
       draw_argument->StartInstance = BaseInstance;
 
       auto [index_buffer, index_sub_offset] = enc.currentIndexBuffer();
-      auto [vertex_per_warp, vertex_increment_per_wrap] = get_gs_vertex_count(topo);
-      auto warp_count = (IndexCountPerInstance - 1) / vertex_increment_per_wrap + 1;
+      auto warp_count = (IndexCountPerInstance - 1) / layout.vertex_increment_per_warp + 1;
+      auto instance_group_count =
+          (InstanceCount - 1) /
+              SM50GSInstancesPerWarp(IndexCountPerInstance, layout.vertex_per_warp, layout.pack_unit) +
+          1;
 
-      if (warp_count * InstanceCount > max_object_threadgroups) {
-        WARN("Omitted mesh draw (GS) because of too many object threadgroups(", warp_count, "x", InstanceCount, ")");
+      if (warp_count * instance_group_count > max_object_threadgroups) {
+        WARN("Omitted mesh draw (GS) because of too many object threadgroups(", warp_count, "x", instance_group_count, ")");
         return;
       }
 
@@ -1602,9 +1696,10 @@ public:
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw_indexed>();
       cmd.type = WMTRenderCommandDXMTGeometryDrawIndexed;
       cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(draw_arguments_offset);
-      cmd.instance_count = InstanceCount;
+      cmd.instance_count = instance_group_count;
       cmd.warp_count = warp_count;
-      cmd.vertex_per_warp = vertex_per_warp;
+      cmd.vertex_per_warp = layout.vertex_per_warp;
+      cmd.mesh_threads = layout.mesh_threads;
       cmd.index_buffer = index_buffer;
       cmd.index_buffer_offset = IndexBufferOffset + index_sub_offset;
     });
@@ -1691,26 +1786,27 @@ public:
     ID3D11Buffer *pBufferForArgs, UINT AlignedByteOffsetForArgs
   ) {
     auto max_object_threadgroups = max_object_threadgroups_;
+    auto layout = GetGeometryDrawLayout();
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
-      EmitOP([=, topo = state_.InputAssembler.Topology, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
+      EmitOP([=, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
             ArgBuffer, AlignedByteOffsetForArgs, sizeof(DXMT_DRAW_ARGUMENTS), ResourceAccess::Read
         );
         auto dispatch_arg = enc.allocateTempBuffer1(sizeof(DXMT_DISPATCH_ARGUMENTS), 4);
 
-        auto [vertex_per_warp, vertex_increment_per_wrap] = get_gs_vertex_count(topo);
-  
         enc.bumpVisibilityResultOffset();
         enc.encodeGSDispatchArgumentsMarshal(
-          buffer->buffer(), buffer->gpuAddress() + buffer_offset, AlignedByteOffsetForArgs, vertex_increment_per_wrap,
-          dispatch_arg.gpu_buffer, dispatch_arg.gpu_address, dispatch_arg.offset, max_object_threadgroups
+          buffer->buffer(), buffer->gpuAddress() + buffer_offset, AlignedByteOffsetForArgs,
+          layout.vertex_increment_per_warp, dispatch_arg.gpu_buffer, dispatch_arg.gpu_address, dispatch_arg.offset,
+          max_object_threadgroups, layout.vertex_per_warp, layout.pack_unit
         );
         enc.resolveRenderPassBarrier();
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw_indirect>();
         cmd.type = WMTRenderCommandDXMTGeometryDrawIndirect;
         cmd.dispatch_args_buffer = dispatch_arg.gpu_buffer;
         cmd.dispatch_args_offset = dispatch_arg.offset;
-        cmd.vertex_per_warp = vertex_per_warp;
+        cmd.vertex_per_warp = layout.vertex_per_warp;
+        cmd.mesh_threads = layout.mesh_threads;
         cmd.indirect_args_buffer = buffer->buffer();
         cmd.indirect_args_offset = buffer_offset + AlignedByteOffsetForArgs;
         cmd.imm_draw_arguments = enc.getFinalArgumentBuffer();
@@ -1724,28 +1820,30 @@ public:
   ) {
     auto IndexBufferOffset = state_.InputAssembler.IndexBufferOffset;
     auto max_object_threadgroups = max_object_threadgroups_;
+    auto layout = GetGeometryDrawLayout();
 
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
-      EmitOP([=, topo = state_.InputAssembler.Topology, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
+      EmitOP([=, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
             ArgBuffer, AlignedByteOffsetForArgs, sizeof(DXMT_DRAW_INDEXED_ARGUMENTS), ResourceAccess::Read
         );
         auto dispatch_arg = enc.allocateTempBuffer1(sizeof(DXMT_DISPATCH_ARGUMENTS), 4);
 
-        auto [vertex_per_warp, vertex_increment_per_wrap] = get_gs_vertex_count(topo);
         auto [index_buffer, index_sub_offset] = enc.currentIndexBuffer();
   
         enc.bumpVisibilityResultOffset();
         enc.encodeGSDispatchArgumentsMarshal(
-          buffer->buffer(), buffer->gpuAddress() + buffer_offset, AlignedByteOffsetForArgs, vertex_increment_per_wrap,
-          dispatch_arg.gpu_buffer, dispatch_arg.gpu_address, dispatch_arg.offset, max_object_threadgroups
+          buffer->buffer(), buffer->gpuAddress() + buffer_offset, AlignedByteOffsetForArgs,
+          layout.vertex_increment_per_warp, dispatch_arg.gpu_buffer, dispatch_arg.gpu_address, dispatch_arg.offset,
+          max_object_threadgroups, layout.vertex_per_warp, layout.pack_unit
         );
         enc.resolveRenderPassBarrier();
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw_indexed_indirect>();
         cmd.type = WMTRenderCommandDXMTGeometryDrawIndexedIndirect;
         cmd.dispatch_args_buffer = dispatch_arg.gpu_buffer;
         cmd.dispatch_args_offset = dispatch_arg.offset;
-        cmd.vertex_per_warp = vertex_per_warp;
+        cmd.vertex_per_warp = layout.vertex_per_warp;
+        cmd.mesh_threads = layout.mesh_threads;
         cmd.indirect_args_buffer = buffer->buffer();
         cmd.indirect_args_offset = AlignedByteOffsetForArgs + buffer_offset;
         cmd.index_buffer = index_buffer;

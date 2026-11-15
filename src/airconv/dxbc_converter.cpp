@@ -1248,6 +1248,11 @@ AIRCONV_API int SM50Initialize(
         pRefl->GeometryShader.GSPassThrough = ~0u;
       }
       pRefl->GeometryShader.Primitive = sm50_shader->gs_input_primitive;
+      pRefl->GeometryShader.MeshThreadsLimit = gs_mesh_threads_limit(sm50_shader.get());
+      pRefl->GeometryShader.PrimitivesPerWarpStrip =
+          std::get<1>(get_vertex_primitive_count_in_warp(sm50_shader->gs_input_primitive, true));
+      pRefl->GeometryShader.VerticesPerPrimitive =
+          std::get<2>(get_vertex_primitive_count_in_warp(sm50_shader->gs_input_primitive, false));
     }
     if (sm50_shader->shader_type == microsoft::D3D10_SB_PIXEL_SHADER) {
       pRefl->PixelShader.ValidRenderTargets = sm50_shader->pso_valid_output_reg_mask;

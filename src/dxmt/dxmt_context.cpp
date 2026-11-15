@@ -963,6 +963,32 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       }
       auto gpu_buffer_ = data->allocated_argbuf;
       auto encoder = cmdbuf.renderCommandEncoder(render_pass_info);
+      {
+        /*
+         * Label for GPU traces (Metal System Trace, Xcode): pipeline kind, attachments, size, then the
+         * load (L load, C clear, D don't care) / store (S store, D discard, R resolve) action of each
+         * attachment, e.g. "GS 0c1d 2048x2048x4 c/ dC/S". An 'L' is a pass that reloads its attachments.
+         */
+        unsigned color_count = 0;
+        for (auto &color : data->colors)
+          color_count += bool(color.attachment);
+        auto label = std::string(data->use_geometry ? "GS " : data->use_tessellation ? "TS " : "R ") +
+                     std::to_string(color_count) + "c" + (data->depth.attachment ? "1d " : "0d ") +
+                     std::to_string(data->render_target_width) + "x" + std::to_string(data->render_target_height) +
+                     "x" + std::to_string(data->render_target_array_length);
+        const char *load_letter = "DLC", *store_letter = "DSRRUU";
+        label += " c";
+        for (auto &color : data->colors)
+          if (color.attachment)
+            label += load_letter[color.load_action];
+        label += "/";
+        for (auto &color : data->colors)
+          if (color.attachment)
+            label += store_letter[color.store_action];
+        if (data->depth.attachment)
+          label += std::string(" d") + load_letter[data->depth.load_action] + "/" + store_letter[data->depth.store_action];
+        encoder.setLabel(WMT::String::string(label.c_str(), WMTUTF8StringEncoding));
+      }
       data->fence_wait.forEach(
           data->fence_wait_vertex, // if a fence is waited pre-raster, no need to wait again at fragment
           [&](auto id) { encoder.waitForFence(fence_pool_[id], WMTRenderStagePreRaster); },
@@ -995,6 +1021,8 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           uint64_t max_object_threadgroups;
           uint32_t vertex_count_per_warp;
           uint32_t end_of_command;
+          uint32_t pack_vertex_per_warp;
+          uint32_t pack_unit;
         };
         auto [mapped_task_data, task_data_buffer, task_data_buffer_offset] =
             queue_.AllocateArgumentBuffer(seq_id_, sizeof(GS_MARSHAL_TASK) * task_count);
@@ -1005,6 +1033,8 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           tasks_data[i].dispatch_args_out = task.dispatch_arguments_va;
           tasks_data[i].max_object_threadgroups = task.max_object_threadgroups;
           tasks_data[i].vertex_count_per_warp = task.vertex_count_per_warp;
+          tasks_data[i].pack_vertex_per_warp = task.pack_vertex_per_warp;
+          tasks_data[i].pack_unit = task.pack_unit;
           tasks_data[i].end_of_command = 0;
           encoder.useResource(task.draw_arguments, WMTResourceUsageRead, WMTRenderStageVertex);
           encoder.useResource(task.dispatch_arguments_buffer, WMTResourceUsageWrite, WMTRenderStageVertex);
