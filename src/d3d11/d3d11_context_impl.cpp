@@ -20,6 +20,9 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
+#include <algorithm>
+#include <unordered_set>
+#include <vector>
 #include "Metal.hpp"
 #include "d3d11_annotation.hpp"
 #include "d3d11_context.hpp"
@@ -4288,6 +4291,17 @@ public:
 
   bool promote_flush = false;
 
+  static constexpr uint32_t kIsolatedPassMaxPixelCount = 64 * 64;
+  bool isolated_pass_ = false;
+  std::vector<ManagedShader> isolated_pass_shaders_;
+  std::unordered_set<ManagedShader> hung_pixel_shaders_;
+
+  /**
+  Commit the current chunk and wait for it to complete on the GPU.
+  Return true if its command buffer ended with an error.
+  */
+  virtual bool FlushAndWait() = 0;
+
   /**
   Render pass can be invalidated by reasons:
   - render target changes (including depth stencil)
@@ -4315,6 +4329,11 @@ public:
         enc.endPass();
       });
       allocated_encoder_argbuf_size_ = nullptr;
+      if (unlikely(isolated_pass_)) {
+        cmdbuf_state = CommandBufferState::Idle;
+        EndIsolatedPass();
+        return true;
+      }
       break;
     }
     case CommandBufferState::ComputeEncoderActive:
@@ -4854,6 +4873,55 @@ public:
     return DrawCallStatus::Ordinary;
   }
 
+  /**
+  A pixel shader invocation that runs for too long (about 50ms on Apple GPUs) trips the GPU watchdog. The recovery
+  discards every encoder being executed at that moment, including unrelated ones from the next chunk such as texture
+  uploads, which are then lost for good.
+
+  Draws that can plausibly take that long (texture sampling in nested loops, on a target of a few tiles at most:
+  typically the convolution of an environment probe) are given a chunk of their own, with nothing else in flight.
+  If that chunk fails, the shader can't complete on this GPU and is not submitted anymore.
+
+  ponytail: the candidates are found by a structural test, not a cost estimate. Use loop trip counts if a game runs
+  such a shader every frame (each isolated pass costs two GPU synchronizations).
+
+  Return false if the draw has to be skipped.
+  */
+  bool
+  IsolateLongRunningDraw() {
+    if (cmdbuf_state == CommandBufferState::RenderPipelineReady ||
+        cmdbuf_state == CommandBufferState::TessellationRenderPipelineReady ||
+        cmdbuf_state == CommandBufferState::GeometryRenderPipelineReady)
+      return true; // same shaders and same pass as the previous draw
+    auto PS = GetManagedShader<PipelineStage::Pixel>();
+    if (likely(!PS || !PS->reflection().PixelShader.HasNestedSamplingLoop))
+      return true;
+    if (hung_pixel_shaders_.contains(PS))
+      return false;
+    uint32_t pixel_count = state_.OutputMerger.RenderTargetWidth * state_.OutputMerger.RenderTargetHeight;
+    if (!pixel_count || pixel_count > kIsolatedPassMaxPixelCount || GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)
+      return true;
+    if (!isolated_pass_) {
+      FlushAndWait();
+      isolated_pass_ = true;
+    }
+    if (std::find(isolated_pass_shaders_.begin(), isolated_pass_shaders_.end(), PS) == isolated_pass_shaders_.end())
+      isolated_pass_shaders_.push_back(PS);
+    return true;
+  }
+
+  void
+  EndIsolatedPass() {
+    isolated_pass_ = false;
+    if (FlushAndWait()) {
+      for (auto PS : isolated_pass_shaders_) {
+        hung_pixel_shaders_.insert(PS);
+        WARN("Pixel shader ", PS->sha1().string(), " failed on the GPU when run alone, its draws are now skipped");
+      }
+    }
+    isolated_pass_shaders_.clear();
+  }
+
   template <bool IndexedDraw>
   DrawCallStatus
   PreDraw() {
@@ -4862,6 +4930,8 @@ public:
       if (!state_.InputAssembler.IndexBuffer)
         return DrawCallStatus::Invalid;
     }
+    if (unlikely(!IsolateLongRunningDraw()))
+      return DrawCallStatus::Invalid;
     if (status = FinalizeCurrentRenderPipeline<IndexedDraw>(); status == DrawCallStatus::Invalid) {
       return status;
     }

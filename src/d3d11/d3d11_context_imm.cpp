@@ -600,6 +600,15 @@ public:
     cmd_queue.WaitCPUFence(seq);
   };
 
+  bool
+  FlushAndWait() override {
+    uint64_t seq = cmd_queue.CurrentSeqId();
+    InvalidateCurrentPass(true);
+    Commit();
+    cmd_queue.WaitCPUFence(seq);
+    return cmd_queue.LastFailedSeqId() == seq;
+  }
+
   void
   Commit() override {
     promote_flush = false;

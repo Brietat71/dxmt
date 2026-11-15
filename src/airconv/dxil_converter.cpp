@@ -1217,6 +1217,7 @@ initialize(
     case microsoft::D3D10_SB_PIXEL_SHADER:
       pRefl->PixelShader.ValidRenderTargets = shader->pso_valid_output_reg_mask;
       pRefl->PixelShader.HasCoverageOutput = shader->ps_has_coverage_output;
+      pRefl->PixelShader.HasNestedSamplingLoop = 0;
       break;
     case microsoft::D3D10_SB_GEOMETRY_SHADER:
       pRefl->GeometryShader.GSPassThrough = ~0u;

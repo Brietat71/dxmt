@@ -198,6 +198,7 @@ CommandQueue::WaitForFinishThread() {
       chunk.attached_cmdbuf.waitUntilCompleted();
     }
     if (chunk.attached_cmdbuf.status() == WMTCommandBufferStatusError) {
+      last_failed_seq_id.store(internal_seq, std::memory_order_release);
       ERR("Device error at frame ", chunk.frame_, ": ", chunk.attached_cmdbuf.error().description().getUTF8String());
     }
     if (auto logs = chunk.attached_cmdbuf.logs()) {

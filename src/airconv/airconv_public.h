@@ -97,6 +97,11 @@ struct MTL_POST_TESSELLATOR_REFLECTION {
 struct MTL_PIXEL_SHADER_REFLECTION {
   uint32_t ValidRenderTargets;
   uint32_t HasCoverageOutput;
+  /**
+  the shader samples a texture inside nested loops: a single invocation can run for a very long time
+  (e.g. brute-force convolution of an environment map)
+   */
+  uint32_t HasNestedSamplingLoop;
 };
 
 struct MTL_SHADER_REFLECTION {

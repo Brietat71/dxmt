@@ -161,6 +161,7 @@ private:
   uint32_t WaitForFinishThread();
 
   std::atomic_uint64_t ready_for_encode = 1; // we start from 1, so 0 is always coherent
+  std::atomic_uint64_t last_failed_seq_id = 0;
   std::atomic_uint64_t ready_for_commit = 1;
   std::atomic_uint64_t chunk_ongoing = 0;
   CpuFence cpu_coherent;
@@ -220,6 +221,15 @@ public:
   uint64_t
   CurrentSeqId() {
     return ready_for_encode.load(std::memory_order_relaxed);
+  };
+
+  /**
+  Sequence id of the last chunk whose command buffer ended with an error (0 if none).
+  Up to date for a chunk once WaitCPUFence() on it has returned.
+   */
+  uint64_t
+  LastFailedSeqId() {
+    return last_failed_seq_id.load(std::memory_order_acquire);
   };
 
   uint64_t
