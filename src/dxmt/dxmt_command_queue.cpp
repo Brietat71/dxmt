@@ -29,8 +29,13 @@
 namespace dxmt {
 
 void *
-CommandChunk::allocate_cpu_heap(size_t size, size_t alignment) {
-  return queue->AllocateCommandData(size, alignment);
+CommandChunk::allocate_cpu_heap_slow(size_t size, size_t alignment) {
+  constexpr size_t kSpan = 0x10000;
+  if (size + alignment > kSpan / 4)
+    return queue->AllocateCommandData(size, alignment);
+  heap_cur_ = (char *)queue->AllocateCommandData(kSpan, std::max(alignment, (size_t)16));
+  heap_end_ = heap_cur_ + kSpan;
+  return allocate_cpu_heap(size, alignment);
 }
 
 CommandQueue::CommandQueue(WMT::Device device) :
@@ -94,6 +99,7 @@ void
 CommandQueue::CommitCurrentChunk() {
   auto chunk_id = ready_for_encode.load(std::memory_order_relaxed);
   auto &chunk = chunks[chunk_id % kCommandChunkCount];
+  chunk.drop_cpu_heap_span(); /* neutron: the span was reserved for this chunk's sequence */
   chunk.chunk_id = chunk_id;
   chunk.chunk_event_id = GetNextEventSeqId();
   committed_event_seq_id = chunk.chunk_event_id; /* neutron */
