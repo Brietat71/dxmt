@@ -26,10 +26,11 @@ L'empreinte `profondeur` doit être identique entre `legacy` et `new` pour chaqu
 | A | 1 450 draws × 498 triangles indexés (VS `75b4cf05` + GS `49993012`) |
 | B | 203 draws × 5 759 instances d'un quad, les billboards d'arbres (VS `ee4035d1` + GS `e9bce06f`) |
 | C | shaders de B, nombres d'indices (1 à 60) et d'instances (1 à 300) variés : paquets d'instances, warps partiels |
-| S | shaders de A en triangle strip : 25 threads par mesh threadgroup, 2 threadgroups par warp |
+| S | shaders de A en triangle strip, avec index de coupure : 25 threads par mesh threadgroup, 2 threadgroups par warp |
 
 `legacy` = dispatch d'origine (payload 16 256 o, 1 thread par mesh threadgroup, un warp par instance).
-`new` = dispatch de `perf-gs`. Le banc recopie ce que font `GeometryDraw*` et `d3d11_pipeline_gs.cpp` : à tenir à jour.
+`new` = dispatch de `perf-gs`. `new1` = dispatch du commit `58b45832` (warps de 30), pour comparer les deux étapes.
+`NORASTER=1` coupe la rastérisation : coût de la géométrie seule. Le banc recopie ce que font `GeometryDraw*` et `d3d11_pipeline_gs.cpp` : à tenir à jour.
 
 Contrôle négatif : `./real libs/new B legacy` donne une autre empreinte.
 
@@ -40,7 +41,7 @@ des variantes de mapping sans toucher au convertisseur.
 
 ```sh
 swiftc -O bench.swift -o bench
-./bench <A|B|AB> <mode 0..3> <mots de payload, 0 = au plus juste> <pack 0|1>
+./bench <A|B|AB> <mode 0..3> <mots de payload, 0 = au plus juste> <pack 0|1> [frames] [sommets par warp]
 ```
 
 Modes : 0 = d'origine, 1 = grille mesh = primitives valides, 2 = un threadgroup + atomiques, 3 = un threadgroup + préfixe en 2 passes.

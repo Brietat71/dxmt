@@ -103,10 +103,12 @@ Charge B = 203 draws × 5 759 instances de 6 indices. Charge A = 1 450 draws × 
 
 ## 7. Changements faits (branche `perf-gs`)
 
-1. **Payload au plus juste** : `SM50GSPayloadSize()` = 16 + 32 × 16 × registres de sortie du VS (528 o ou 1 040 o pour WARNO, au lieu de 16 256).
-   Convertisseur (object et mesh) et `payload_memory_length` du pipeline.
-2. **GS regroupés par mesh threadgroup** : `SM50GSMeshThreads()` = min(primitives du warp, 256 / (maxvertexcount + 1)) threads,
-   un thread par invocation du GS (10 pour WARNO au lieu de 1).
+Deux commits : `58b45832` (points 1 à 3) puis `4d0b7d2a` (point 4).
+
+1. **Payload au plus juste** : `SM50GSPayloadSize()` = en-tête + sommets du warp × (mot de validité + 16 o × registres de sortie du VS),
+   soit 1 296 o ou 2 320 o pour WARNO au lieu de 16 256. Convertisseur (object et mesh) et `payload_memory_length` du pipeline.
+2. **GS regroupés par mesh threadgroup** : min(primitives du warp, `SM50GSMeshThreadsLimit()` = 256 / (maxvertexcount + 1)) threads,
+   un thread par invocation du GS (20 pour WARNO au lieu de 1).
    - Le corps du GS est converti deux fois. Passe 1 : compter sommets et primitives émis. Somme préfixe sur le threadgroup
      (mémoire threadgroup + barrière). Passe 2 : écrire dans la tranche du thread.
    - Le mesh reste compact et **dans l'ordre des primitives d'entrée** : même ordre de rendu qu'avant.
@@ -120,30 +122,48 @@ Charge B = 203 draws × 5 759 instances de 6 indices. Charge A = 1 450 draws × 
    - Object shader : thread → (instance, sommet). `SV_InstanceID`, le tirage des vertex buffers par instance et `SV_PrimitiveID` suivent.
    - Grille de dispatch : `(1, ceil(instances / K))`. Draws directs dans `GeometryDraw*`, draws indirects dans le marshal GPU
      (`gs_draw_arguments_marshal`), même formule aux trois endroits.
-4. `AIRCONV_VERSION` 26 → 27 : invalide le cache de shaders (l'ancien AIR est incompatible avec le nouveau dispatch).
-5. `airconv` (CLI de dev) : `--ia-layout`, `--ia-index-format`, `--gs-strip`, pour produire hors-jeu les shaders tels que le runtime les compile.
+4. **Warps de 64 sommets** pour les topologies en liste (`SM50GSWarpScale()`), quand le payload a la place (jusqu'à 15 registres de sortie du VS).
+   Liste de triangles : 60 sommets, 20 invocations de GS par mesh threadgroup, 10 quads par paquet. Deux fois moins de threadgroups.
+   - Rendu possible par les **mots de validité** : chaque thread object écrit dans le payload si son sommet est valide
+     (dans le draw, pas un index de coupure). Le mesh shader en déduit la validité de sa primitive.
+   - L'object shader n'a plus ni masque atomique 32 bits, ni barrière, ni boucle de masques par primitive.
+   - Un thread dont le GS n'émet rien saute la passe d'écriture.
+5. `AIRCONV_VERSION` 26 → 27 : invalide le cache de shaders (l'ancien AIR est incompatible avec le nouveau dispatch).
+6. `airconv` (CLI de dev) : `--ia-layout`, `--ia-index-format`, `--gs-strip`, pour produire hors-jeu les shaders tels que le runtime les compile.
 
 Rien de spécifique à une architecture : tout est dans le convertisseur, l'encodeur de draws et le shader de marshal.
 
 ## 8. Vérification hors-jeu (`tools/gs-bench/real.swift`, vrais shaders de WARNO)
 
-Tampon de profondeur 4 couches comparé **au bit près** entre l'ancien convertisseur + ancien dispatch et le nouveau :
+Tampon de profondeur 4 couches comparé **au bit près** entre l'ancien convertisseur + ancien dispatch et le nouveau.
+GPU au repos, médiane de 6 à 10 frames, `4d0b7d2a` :
 
 | Scénario | Ancien (ms GPU) | Nouveau (ms GPU) | Profondeur |
 |---|---|---|---|
-| A : 1 450 draws × 498 triangles | 4,1 | 1,45 | identique |
-| B : 203 draws × 5 759 billboards | 40,5 | 5,1 | identique |
-| C : indices 1 à 60, instances 1 à 300 (paquets, warps partiels) | 8,3 | 2,6 | identique |
-| S : triangle strip (25 threads, 2 mesh TG par warp) | 8,4 | 2,7 | identique |
+| A : 1 450 draws × 498 triangles | 3,2 | 1,1 | identique |
+| B : 203 draws × 5 759 billboards | 38,4 | 5,6 | identique |
+| C : indices 1 à 60, instances 1 à 300 (paquets, warps partiels) | 4,2 | 1,3 | identique |
+| S : triangle strip avec index de coupure (25 threads, 2 mesh TG par warp) | 3,3 | 1,3 | identique |
 
-- A et B mesurés GPU au repos ; C et S pendant qu'un autre agent faisait tourner le jeu (ratios valables, valeurs absolues gonflées).
-- Sous charge concurrente : B 52-67 → 6,5-8,7 ms, A 5,0-8,8 → 2,0-3,3 ms.
+Géométrie seule (rastérisation coupée, `NORASTER=1`) :
+
+| Scénario | Ancien | `58b45832` | `4d0b7d2a` |
+|---|---|---|---|
+| B : billboards | 38,4 | 2,6 | **2,0** |
+| A : triangles indexés | 3,3 | 1,2 | **0,9** |
+
+- Dans B, la rastérisation des 1,5 M de petits triangles coûte 3,6 ms. Avant, elle était cachée derrière la géométrie
+  (38,4 ms avec ou sans). **Le coût de l'émulation GS passe de ~42 ms à ~3 ms ; ce qui reste dans les passes d'ombre est le remplissage.**
 - Contrôle négatif : nouveaux shaders avec l'ancien dispatch → empreinte différente.
+- Sous charge (un autre agent fait tourner le jeu), les valeurs absolues montent de 30 à 70 % ; les ratios tiennent.
 - Non couvert hors-jeu : sorties point et ligne, GS instancié, draws GS indirects, chemin d3d11 réel (pipeline, cache). À voir en jeu.
+- Piste écartée après mesure : warps de 84 sommets, aucun gain de plus que 60 (banc synthétique).
 
 ## 9. Reste à faire
 
 - [ ] Session jeu ≤ 10 min : A/B base contre `perf-gs`, Élevé (chargement direct) puis Moyen (bascule en jeu), captures.
+      Script : `~/code/dxmt-gs-data/session.sh <tag> <payload A> <payload B>` (verrou, mesures, restauration, chien de garde 540 s).
+      Payloads figés : `~/code/dxmt-gs-data/p-base` (`eb1a631f`), `p-opt1` (`58b45832`), `p-opt2` (`4d0b7d2a`).
 - [ ] Si le canal Vertex reste haut : Metal System Trace sur le build optimisé pour voir ce qui reste.
 
 ## 10. Banc
