@@ -41,6 +41,10 @@
 #include "util_flags.hpp"
 #include "util_math.hpp"
 #include "util_win32_compat.h"
+#include "util_env.hpp"
+#include <chrono>
+#include <mutex>
+#include <unordered_map>
 
 namespace dxmt {
 
@@ -166,6 +170,41 @@ to_metal_primitive_topology(D3D11_PRIMITIVE_TOPOLOGY topo) {
     D3D11_ASSERT(0 && "Invalid topology");
   }
   return WMTPrimitiveTopologyClassUnspecified;
+}
+
+/**
+DXMT_DEBUG_GS_STATS=1: every 10 seconds, log what went through the geometry shader path, per VS+GS pair:
+draws, vertices (count x instances), instances and object threadgroups per second.
+*/
+inline void
+LogGeometryDrawStats(ManagedShader vs, ManagedShader gs, uint64_t count, uint64_t instances, uint64_t object_tg) {
+  struct Stat {
+    uint64_t draws = 0, vertices = 0, instances = 0, object_tg = 0;
+    ManagedShader vs = nullptr, gs = nullptr;
+  };
+  static std::mutex mutex;
+  static std::unordered_map<uint64_t, Stat> stats;
+  static auto last = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lock(mutex);
+  auto &stat = stats[(uint64_t)(uintptr_t)vs * 31 + (uint64_t)(uintptr_t)gs];
+  stat.vs = vs;
+  stat.gs = gs;
+  stat.draws++;
+  stat.vertices += count * instances;
+  stat.instances += instances;
+  stat.object_tg += object_tg;
+  auto now = std::chrono::steady_clock::now();
+  if (now - last < std::chrono::seconds(10))
+    return;
+  double dt = std::chrono::duration<double>(now - last).count();
+  for (auto &[key, v] : stats)
+    Logger::info(str::format(
+        "gs stats: vs ", v.vs->sha1().string().substr(0, 12), " gs ", v.gs->sha1().string().substr(0, 12), " draws/s ",
+        uint64_t(v.draws / dt), " vertices/s ", uint64_t(v.vertices / dt), " instances/draw ", v.instances / v.draws,
+        " object_tg/s ", uint64_t(v.object_tg / dt)
+    ));
+  stats.clear();
+  last = now;
 }
 
 inline bool is_strip_topology(D3D11_PRIMITIVE_TOPOLOGY topo) {
@@ -1610,6 +1649,18 @@ public:
   }
 
   void
+  LogGeometryDraw(UINT Count, UINT InstanceCount, const GeometryDrawLayout &layout) {
+    static const bool enabled = !env::getEnvVar("DXMT_DEBUG_GS_STATS").empty();
+    if (likely(!enabled))
+      return;
+    LogGeometryDrawStats(
+        GetManagedShader<PipelineStage::Vertex>(), GetManagedShader<PipelineStage::Geometry>(), Count, InstanceCount,
+        uint64_t((Count - 1) / layout.vertex_increment_per_warp + 1) *
+            ((InstanceCount - 1) / SM50GSInstancesPerWarp(Count, layout.vertex_per_warp, layout.pack_unit) + 1)
+    );
+  }
+
+  void
   GeometryDraw(
       UINT VertexCountPerInstance, UINT InstanceCount, UINT StartVertexLocation,
       UINT StartInstanceLocation
@@ -1617,6 +1668,7 @@ public:
     auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_ARGUMENTS), 32);
     auto max_object_threadgroups = max_object_threadgroups_;
     auto layout = GetGeometryDrawLayout();
+    LogGeometryDraw(VertexCountPerInstance, InstanceCount, layout);
     EmitOP([=](ArgumentEncodingContext &enc) {
       DXMT_DRAW_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(draw_arguments_offset);
       draw_argument->StartVertex = StartVertexLocation;
@@ -1657,6 +1709,7 @@ public:
     auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_INDEXED_ARGUMENTS), 32);
     auto max_object_threadgroups = max_object_threadgroups_;
     auto layout = GetGeometryDrawLayout();
+    LogGeometryDraw(IndexCountPerInstance, InstanceCount, layout);
     EmitOP([=](ArgumentEncodingContext &enc) {
       DXMT_DRAW_INDEXED_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(draw_arguments_offset);
       draw_argument->BaseVertex = BaseVertexLocation;
