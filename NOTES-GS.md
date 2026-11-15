@@ -103,7 +103,7 @@ Charge B = 203 draws × 5 759 instances de 6 indices. Charge A = 1 450 draws × 
 
 ## 7. Changements faits (branche `perf-gs`)
 
-Deux commits : `58b45832` (points 1 à 3) puis `4d0b7d2a` (point 4).
+Trois commits : `58b45832` (points 1 à 3), `4d0b7d2a` (point 4), `cc3d8a81` (suites de la relecture).
 
 1. **Payload au plus juste** : `SM50GSPayloadSize()` = en-tête + sommets du warp × (mot de validité + 16 o × registres de sortie du VS),
    soit 1 296 o ou 2 320 o pour WARNO au lieu de 16 256. Convertisseur (object et mesh) et `payload_memory_length` du pipeline.
@@ -159,11 +159,22 @@ Géométrie seule (rastérisation coupée, `NORASTER=1`) :
 - Non couvert hors-jeu : sorties point et ligne, GS instancié, draws GS indirects, chemin d3d11 réel (pipeline, cache). À voir en jeu.
 - Piste écartée après mesure : warps de 84 sommets, aucun gain de plus que 60 (banc synthétique).
 
+### Relecture indépendante du diff (agent de revue, chemins non exercés par le banc)
+
+- Rien trouvé sur : sorties ligne et point en mode regroupé, équivalence des mots de validité avec les anciens masques
+  (listes, strips, adjacences), chemin non regroupé, accord convertisseur / encodeur / marshal, disposition des structs, dominance SSA.
+- Corrigé dans `cc3d8a81` : un GS avec UAV reste à 1 invocation par mesh threadgroup (le corps tourne deux fois en mode regroupé) ;
+  arrondi du marshal indirect aligné sur l'encodeur.
+- Signalé, antérieur à ce travail, laissé tel quel : en triangle strip avec adjacence, le sommet adjacent de la primitive 0
+  est lu à l'index 2 au lieu de 31 (`URem` sur une valeur non signée qui a bouclé, `dxbc_converter_gs.cpp`, cas `TRIANGLE_ADJ`).
+  Le corriger changerait le rendu par rapport à la base : hors périmètre.
+- Les shaders de WARNO convertis par `cc3d8a81` sont identiques à l'octet près à ceux de `4d0b7d2a`.
+
 ## 9. Reste à faire
 
 - [ ] Session jeu ≤ 10 min : A/B base contre `perf-gs`, Élevé (chargement direct) puis Moyen (bascule en jeu), captures.
       Script : `~/code/dxmt-gs-data/session.sh <tag> <payload A> <payload B>` (verrou, mesures, restauration, chien de garde 540 s).
-      Payloads figés : `~/code/dxmt-gs-data/p-base` (`eb1a631f`), `p-opt1` (`58b45832`), `p-opt2` (`4d0b7d2a`).
+      Payloads figés : `~/code/dxmt-gs-data/p-base` (`eb1a631f`), `p-opt1` (`58b45832`), `p-opt2` (`cc3d8a81`, version finale).
 - [ ] Si le canal Vertex reste haut : Metal System Trace sur le build optimisé pour voir ce qui reste.
 
 ## 10. Banc
