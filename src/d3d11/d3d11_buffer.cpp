@@ -114,7 +114,20 @@ public:
     structured = pDesc->MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
     allow_raw_view = pDesc->MiscFlags & D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
     if (!(desc.BindFlags & kD3D11OutputBindFlags)) {
-      dynamic_ = new DynamicBuffer(buffer_.ptr(), flags);
+      /* neutron: a DEFAULT buffer is renamed on every full UpdateSubresource. Each rename took its
+         own MTLBuffer, so a frame with thousands of updates referenced thousands of buffers
+         (useResource per draw, slow command buffer submit, GPU bound at a fifth of the frame
+         rate). Renamed allocations of small constant, vertex and index buffers are suballocated
+         from one page like dynamic buffers, in shared storage (unified memory, a plain memcpy
+         instead of a unix call per update). The first allocation keeps its layout, so buffers
+         that are never updated cost no extra memory; these bind flags allow no buffer views. */
+      Flags<BufferAllocationFlag> rename_flags = flags;
+      if (pDesc->Usage == D3D11_USAGE_DEFAULT && !pDesc->MiscFlags &&
+          !(pDesc->BindFlags & ~(D3D11_BIND_CONSTANT_BUFFER | D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER))) {
+        rename_flags.set(BufferAllocationFlag::SuballocateFromOnePage);
+        rename_flags.clr(BufferAllocationFlag::GpuManaged);
+      }
+      dynamic_ = new DynamicBuffer(buffer_.ptr(), rename_flags);
     }
   }
 
