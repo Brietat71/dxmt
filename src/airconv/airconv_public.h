@@ -88,9 +88,9 @@ struct MTL_GEOMETRY_SHADER_REFLECTION {
     uint32_t GSPassThrough;
   };
   uint32_t Primitive;
-  /* threads per mesh threadgroup (= GS invocations batched in one mesh), for list and strip topologies */
-  uint8_t MeshThreadsList;
-  uint8_t MeshThreadsStrip;
+  /* GS invocations a mesh threadgroup can hold, see SM50GSMeshThreadsLimit() */
+  uint8_t MeshThreadsLimit;
+  uint8_t PrimitivesPerWarpStrip;
   uint8_t VerticesPerPrimitive;
   uint8_t Reserved;
 };
@@ -100,19 +100,30 @@ struct MTL_GEOMETRY_SHADER_REFLECTION {
  * the pipeline and the draw encoder. They must agree.
  */
 
-/* object payload: 4 header words, then one float4 per vertex output register for up to 32 vertices */
-static inline uint32_t SM50GSPayloadSize(uint32_t NumVertexOutputElement) {
-  uint32_t size = 16 + 32 * 16 * NumVertexOutputElement;
+/*
+ * A warp is the batch of vertices of one object threadgroup. Warps of list topologies hold twice
+ * the vertices of the base layout (up to 64) when the payload has room for them.
+ */
+static inline uint32_t SM50GSWarpScale(uint32_t NumVertexOutputElement, uint32_t VerticesPerPrimitive, bool Strip) {
+  return !Strip && VerticesPerPrimitive >= 2 && 16 + 64 * (4 + 16 * NumVertexOutputElement) <= 16256 ? 2 : 1;
+}
+
+/*
+ * object payload: 4 header words, one validity word per vertex,
+ * then one float4 per vertex output register and vertex
+ */
+static inline uint32_t SM50GSPayloadSize(uint32_t NumVertexOutputElement, uint32_t WarpScale) {
+  uint32_t size = 16 + 32 * WarpScale * (4 + 16 * NumVertexOutputElement);
   return size < 16256 ? size : 16256;
 }
 
 /*
- * GS invocations (threads) per mesh threadgroup. Metal allows 256 vertices per mesh;
+ * GS invocations (threads) a mesh threadgroup can hold. Metal allows 256 vertices per mesh;
  * each invocation owns MaxVertexCount vertices plus one scratch vertex.
  */
-static inline uint32_t SM50GSMeshThreads(uint32_t PrimitivesPerWarp, uint32_t MaxVertexCount) {
+static inline uint32_t SM50GSMeshThreadsLimit(uint32_t MaxVertexCount) {
   uint32_t n = 256 / (MaxVertexCount + 1);
-  return n < 1 ? 1 : n > PrimitivesPerWarp ? PrimitivesPerWarp : n;
+  return n < 1 ? 1 : n > 64 ? 64 : n;
 }
 
 /*

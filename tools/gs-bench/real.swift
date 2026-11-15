@@ -6,16 +6,20 @@ import Metal
 import Foundation
 
 let a = CommandLine.arguments
-let libdir = a[1], scen = a[2], isNew = a[3] == "new"
+let libdir = a[1], scen = a[2], isNew = a[3].hasPrefix("new")
+let phase1 = a[3] == "new1"   // layout du commit 58b45832 (warps de 30, payload sans mots de validité), pour comparer
 let frames = a.count > 4 ? Int(a[4])! : 12
 let dev = MTLCreateSystemDefaultDevice()!
 let q = dev.makeCommandQueue()!
 
 let nreg = scen == "A" ? 1 : 2; let shaders = scen == "C" ? "B" : scen                                // registres de sortie du VS
-let payload = isNew ? min(16 + 32 * 16 * nreg, 16256) : 16256 // SM50GSPayloadSize
 let strip = scen == "S"                                       // S : shaders de A, topologie triangle strip
-let meshThreads = isNew ? (strip ? 25 : 10) : 1               // SM50GSMeshThreads(10 ou 30, 9)
-let objThreads = strip ? 32 : 30
+// miroir de airconv_public.h : SM50GSWarpScale, SM50GSPayloadSize, SM50GSMeshThreadsLimit, et de GetGeometryDrawLayout
+let scale = isNew && !phase1 && !strip && 16 + 64 * (4 + 16 * nreg) <= 16256 ? 2 : 1
+let payload = !isNew ? 16256 : phase1 ? 16 + 32 * 16 * nreg : min(16 + 32 * scale * (4 + 16 * nreg), 16256)
+let warpInc = 30 * scale                                      // sommets consommés par warp
+let objThreads = strip ? 32 : warpInc
+let meshThreads = isNew ? min(256 / (9 + 1), strip ? 30 : warpInc / 3) : 1
 
 func fn(_ name: String) -> MTLFunction {
   try! dev.makeLibrary(URL: URL(fileURLWithPath: "\(libdir)/\(shaders)_\(name).metallib")).makeFunction(name: "shader_main")!
@@ -24,6 +28,7 @@ let pd = MTLMeshRenderPipelineDescriptor()
 pd.objectFunction = fn("obj"); pd.meshFunction = fn("mesh")
 pd.payloadMemoryLength = payload
 pd.depthAttachmentPixelFormat = .depth32Float
+if ProcessInfo.processInfo.environment["NORASTER"] != nil { pd.isRasterizationEnabled = false }   // coût géométrie seul
 let pso = try! dev.makeRenderPipelineState(descriptor: pd, options: []).0
 
 let side = 2048
@@ -65,7 +70,8 @@ if scen == "A" || strip {
     let cx = rnd() * 1900 - 950, cy = rnd() * 1900 - 950
     for _ in 0..<vpd { vb += [cx + rnd() * 40 - 20, cy + rnd() * 40 - 20, rnd() * 50] }
   }
-  for _ in 0..<(tris * 3) { idx.append(UInt16(rnd() * Float(vpd))) }
+  // strip : un index de coupure (0xFFFF) de temps en temps, pour le chemin « sommet invalide »
+  for i in 0..<(tris * 3) { idx.append(strip && i % 53 == 52 ? 0xFFFF : UInt16(rnd() * Float(vpd))) }
   // strip : longueurs variées, pour les warps partiels
   for d in 0..<draws { args.append(DrawArgs(indexCount: UInt32(strip ? 3 + (d * 37) % 900 : tris * 3), instanceCount: 1, startIndex: 0, baseVertex: Int32(d * vpd), startInstance: 0)) }
   let bv = buf(vb); ib = buf(idx)
@@ -123,8 +129,8 @@ func frame(readback: MTLBuffer?) -> Double {
     e.setObjectBufferOffset(i * MemoryLayout<DrawArgs>.stride, index: 4)
     let count = Int(d.indexCount), inst = Int(d.instanceCount)
     // comme GeometryDrawIndexed : SM50GSInstancesPerWarp
-    let k = isNew && !strip && count <= 15 && count % 3 == 0 ? 30 / count : 1
-    e.drawMeshThreadgroups(MTLSize(width: (count - 1) / 30 + 1, height: (inst - 1) / k + 1, depth: 1),
+    let k = isNew && !strip && count <= objThreads / 2 && count % 3 == 0 ? objThreads / count : 1   // SM50GSInstancesPerWarp
+    e.drawMeshThreadgroups(MTLSize(width: (count - 1) / warpInc + 1, height: (inst - 1) / k + 1, depth: 1),
                            threadsPerObjectThreadgroup: MTLSize(width: objThreads, height: 1, depth: 1),
                            threadsPerMeshThreadgroup: MTLSize(width: meshThreads, height: 1, depth: 1))
   }
