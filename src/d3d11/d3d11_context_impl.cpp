@@ -4897,7 +4897,23 @@ public:
     MTL_GRAPHICS_PIPELINE_DESC pipelineDesc;
     InitializeGraphicsPipelineDesc<IndexedDraw>(pipelineDesc);
 
-    device->CreateGraphicsPipeline(&pipelineDesc, &pipeline);
+    /* neutron: small per-context cache in front of the device's pipeline map (lock, modulo bucket
+       lookup, node walk). Shaders, input layouts and state objects live as long as the device, so their
+       pointers in the key stay valid; descs with a stream output layout (an app object) bypass it. */
+    if (!pipelineDesc.SOLayout) {
+      size_t hash = std::hash<MTL_GRAPHICS_PIPELINE_DESC>{}(pipelineDesc);
+      auto &slot = pipeline_lookup_cache_[hash % pipeline_lookup_cache_.size()];
+      if (slot.pipeline && slot.hash == hash && std::equal_to<MTL_GRAPHICS_PIPELINE_DESC>{}(slot.desc, pipelineDesc)) {
+        pipeline = slot.pipeline;
+      } else {
+        device->CreateGraphicsPipeline(&pipelineDesc, &pipeline);
+        slot.hash = hash;
+        slot.desc = pipelineDesc;
+        slot.pipeline = pipeline;
+      }
+    } else {
+      device->CreateGraphicsPipeline(&pipelineDesc, &pipeline);
+    }
     EmitST([pso = std::move(pipeline)](ArgumentEncodingContext& enc) {
       MTL_COMPILED_GRAPHICS_PIPELINE GraphicsPipeline{};
       pso->GetPipeline(&GraphicsPipeline); // may block
@@ -5213,6 +5229,13 @@ public:
   };
 
   Flags<DirtyState> dirty_state = 0;
+
+  struct PipelineLookupCacheEntry {
+    size_t hash = 0;
+    MTL_GRAPHICS_PIPELINE_DESC desc;
+    MTLCompiledGraphicsPipeline *pipeline = nullptr;
+  };
+  std::array<PipelineLookupCacheEntry, 64> pipeline_lookup_cache_ = {};
 
 #pragma endregion
 
