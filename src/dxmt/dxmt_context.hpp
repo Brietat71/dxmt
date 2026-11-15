@@ -235,6 +235,10 @@ struct ClearEncoderData : EncoderData {
   unsigned array_length;
   unsigned width;
   unsigned height;
+  /* neutron: a D3D11 Discard*: turns the next load and the previous store of the attachment into DontCare */
+  bool discard = false;
+  /* neutron: discard of the whole resource, matches any view of the allocation */
+  bool whole = false;
 
   ClearEncoderData() {}
 };
@@ -684,6 +688,7 @@ public:
   };
 
   void clearColor(Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength, WMTClearColor color);
+  void discardTexture(Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength, unsigned planarFlags, bool whole);
   void clearDepthStencil(
       Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength, unsigned flag, float depth, uint8_t stencil
   );
@@ -849,6 +854,8 @@ private:
   DXMT_ENCODER_LIST_OP checkEncoderRelation(EncoderData* former, EncoderData* latter);
   bool hasDataDependency(EncoderData* from, EncoderData* to);
   bool isEncoderSignatureMatched(RenderEncoderData* former, RenderEncoderData* latter);
+  bool isClearAttachmentMatched(ClearEncoderData *clear, const TextureViewRef &attachment);
+  void applyClearStoreHint(RenderEncoderData *render, ClearEncoderData *clear);
   RenderEncoderColorAttachmentData *isClearColorSignatureMatched(ClearEncoderData* former, RenderEncoderData* latter);
   RenderEncoderDepthAttachmentData *isClearDepthSignatureMatched(ClearEncoderData* former, RenderEncoderData* latter);
   RenderEncoderStencilAttachmentData *isClearStencilSignatureMatched(ClearEncoderData* former, RenderEncoderData* latter);

@@ -1267,12 +1267,29 @@ public:
   STDMETHODCALLTYPE
   DiscardResource(ID3D11Resource *pResource) override {
     /*
-    All the Discard* API is not implemented and that's probably fine (as it's
-    more like a hint of optimization, and Metal manages resources on its own)
-    FIXME: for render targets we can use this information: LoadActionDontCare
+    neutron: for render targets and depth buffers the hint becomes LoadActionDontCare on the next render pass
+    and StoreActionDontCare on the previous one (see ClearEncoderData::discard). Buffers and other textures
+    are left alone.
     FIXME: A Map with D3D11_MAP_WRITE type could become D3D11_MAP_WRITE_DISCARD?
     */
-    ERR_ONCE("Not implemented");
+    std::lock_guard<mutex_t> lock(mutex);
+    if (!pResource)
+      return;
+    D3D11_RESOURCE_DIMENSION dimension;
+    pResource->GetType(&dimension);
+    if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER || dimension == D3D11_RESOURCE_DIMENSION_UNKNOWN)
+      return;
+    if (!(static_cast<D3D11ResourceCommon *>(pResource)->bindFlags() &
+          (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL)))
+      return;
+    auto texture = GetTexture(pResource);
+    if (!texture)
+      return;
+    InvalidateCurrentPass();
+    EmitOP([texture = std::move(texture)](ArgumentEncodingContext &enc) mutable {
+      auto view = texture->fullView;
+      enc.discardTexture(forward_rc(texture), view, 0, 0b11, true);
+    });
   }
 
   void
@@ -1284,7 +1301,32 @@ public:
   void
   STDMETHODCALLTYPE
   DiscardView1(ID3D11View *pResourceView, const D3D11_RECT *pRects, UINT NumRects) override {
-    ERR_ONCE("Not implemented");
+    /* neutron: whole render target and depth stencil views, see DiscardResource */
+    std::lock_guard<mutex_t> lock(mutex);
+    if (!pResourceView || NumRects)
+      return;
+    if (auto expected = com_cast<ID3D11RenderTargetView>(pResourceView)) {
+      auto rtv = static_cast<D3D11RenderTargetView *>(expected.ptr());
+      if (!rtv->texture())
+        return;
+      InvalidateCurrentPass();
+      EmitOP([texture = rtv->texture(), view = rtv->viewId(),
+              array_length = rtv->description().RenderTargetArrayLength](ArgumentEncodingContext &enc) mutable {
+        enc.discardTexture(forward_rc(texture), view, array_length, 0, false);
+      });
+      return;
+    }
+    if (auto expected = com_cast<ID3D11DepthStencilView>(pResourceView)) {
+      auto dsv = static_cast<D3D11DepthStencilView *>(expected.ptr());
+      if (!dsv->texture())
+        return;
+      InvalidateCurrentPass();
+      EmitOP([texture = dsv->texture(), view = dsv->viewId(),
+              array_length = dsv->description().RenderTargetArrayLength](ArgumentEncodingContext &enc) mutable {
+        enc.discardTexture(forward_rc(texture), view, array_length, 0b11, false);
+      });
+      return;
+    }
   }
 #pragma endregion
 

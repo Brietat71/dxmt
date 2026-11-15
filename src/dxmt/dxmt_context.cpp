@@ -511,6 +511,31 @@ ArgumentEncodingContext::clearDepthStencil(
   endPass();
 }
 
+/* neutron: D3D11 DiscardView/DiscardResource, see ClearEncoderData::discard */
+void
+ArgumentEncodingContext::discardTexture(
+    Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength, unsigned planarFlags, bool whole
+) {
+  assert(!encoder_current);
+  auto encoder_info = allocate<ClearEncoderData>();
+  encoder_info->type = EncoderType::Clear;
+  encoder_info->id = nextEncoderId();
+  encoder_info->fence_wait = {};
+  encoder_info->fence_update = {encoder_info->id};
+  encoder_info->discard = true;
+  encoder_info->whole = whole;
+  encoder_info->clear_dsv = planarFlags & DepthStencilPlanarFlags(texture->pixelFormat());
+  encoder_info->color = {};
+  encoder_info->array_length = arrayLength;
+  encoder_info->width = texture->width(viewId);
+  encoder_info->height = texture->height(viewId);
+  encoder_current = encoder_info;
+
+  encoder_info->attachment = access(texture, viewId, ResourceAccess::Write);
+
+  endPass();
+}
+
 void
 ArgumentEncodingContext::resolveTexture(
     Rc<Texture> &&src, TextureViewKey src_view, Rc<Texture> &&dst, TextureViewKey dst_view
@@ -888,8 +913,63 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       for (i = j + 1; i < encoder_count; i++) {
         if (encoders[i]->type == EncoderType::Null)
           continue;
-        if (checkEncoderRelation(encoders[j], encoders[i]) == DXMT_ENCODER_LIST_OP_SYNCHRONIZE)
+        if (checkEncoderRelation(encoders[j], encoders[i]) == DXMT_ENCODER_LIST_OP_SYNCHRONIZE) {
+          /* neutron: clears and discards right after a render pass only write, so the store hint of each
+             one in the run still holds (a pass that is followed by "discard color, discard depth") */
+          if (encoders[j]->type == EncoderType::Render && encoders[i]->type == EncoderType::Clear) {
+            for (unsigned k = i + 1; k < encoder_count; k++) {
+              if (encoders[k]->type == EncoderType::Null)
+                continue;
+              if (encoders[k]->type != EncoderType::Clear)
+                break;
+              applyClearStoreHint(
+                  static_cast<RenderEncoderData *>(encoders[j]), static_cast<ClearEncoderData *>(encoders[k])
+              );
+            }
+          }
           break;
+        }
+      }
+    }
+  }
+
+  /* neutron: a discard that was not merged into a render pass only orders its fences. If everything it waits for
+     is already waited for (or done) by the encoder before it, that encoder signals the discard's fence instead,
+     which saves an empty blit encoder (a few microseconds of GPU time each). */
+  {
+    EncoderData *prev = nullptr;
+    for (unsigned k = 0; k < encoder_count; k++) {
+      auto e = encoders[k];
+      if (e->type == EncoderType::Null)
+        continue;
+      if (e->type == EncoderType::Clear && static_cast<ClearEncoderData *>(e)->discard && prev) {
+        FenceSet covered = prev->fence_wait.unionOf(prev->fence_update);
+        if (prev->type == EncoderType::Render) {
+          auto r = static_cast<RenderEncoderData *>(prev);
+          covered.merge(r->fence_wait_vertex).merge(r->fence_update_vertex);
+        }
+        /* a run of discards that stay becomes one empty encoder that waits for all of them */
+        bool prev_is_discard = prev->type == EncoderType::Clear && static_cast<ClearEncoderData *>(prev)->discard;
+        if (prev_is_discard || covered.contains(e->fence_wait)) {
+          if (prev_is_discard)
+            prev->fence_wait.merge(e->fence_wait);
+          prev->fence_update.merge(e->fence_update);
+          static_cast<ClearEncoderData *>(e)->~ClearEncoderData();
+          e->type = EncoderType::Null;
+          continue;
+        }
+      }
+      switch (e->type) {
+      case EncoderType::Render:
+      case EncoderType::Compute:
+      case EncoderType::Blit:
+      case EncoderType::Clear:
+      case EncoderType::Resolve:
+        prev = e;
+        break;
+      default:
+        prev = nullptr; // events, timestamps, present: keep the discard as its own encoder
+        break;
       }
     }
   }
@@ -1107,6 +1187,15 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
     }
     case EncoderType::Clear: {
       auto data = static_cast<ClearEncoderData *>(current);
+      if (data->discard) {
+        /* neutron: nothing to do on the GPU, only keep the fence chain intact */
+        auto encoder = cmdbuf.blitCommandEncoder();
+        data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id]); });
+        data->fence_update.forEach([&](auto id) { encoder.updateFence(fence_pool_[id]); });
+        encoder.endEncoding();
+        data->~ClearEncoderData();
+        break;
+      }
       {
         WMTRenderPassInfo info;
         WMT::InitializeRenderPassInfo(info);
@@ -1297,19 +1386,25 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
       auto render = reinterpret_cast<RenderEncoderData *>(latter);
       auto clear = reinterpret_cast<ClearEncoderData *>(former);
 
-      if (render->render_target_array_length != clear->array_length)
+      if (!clear->whole && render->render_target_array_length != clear->array_length)
         break;
 
       if (clear->clear_dsv) {
         if (auto depth_attachment = isClearDepthSignatureMatched(clear, render)) {
-          if (depth_attachment->load_action == WMTLoadActionLoad) {
+          if (clear->discard) {
+            if (depth_attachment->load_action == WMTLoadActionLoad)
+              depth_attachment->load_action = WMTLoadActionDontCare;
+          } else if (depth_attachment->load_action == WMTLoadActionLoad) {
             depth_attachment->clear_depth = clear->depth_stencil.first;
             depth_attachment->load_action = WMTLoadActionClear;
           }
           clear->clear_dsv &= ~1;
         }
         if (auto stencil_attachment = isClearStencilSignatureMatched(clear, render)) {
-          if (stencil_attachment->load_action == WMTLoadActionLoad) {
+          if (clear->discard) {
+            if (stencil_attachment->load_action == WMTLoadActionLoad)
+              stencil_attachment->load_action = WMTLoadActionDontCare;
+          } else if (stencil_attachment->load_action == WMTLoadActionLoad) {
             stencil_attachment->clear_stencil = clear->depth_stencil.second;
             stencil_attachment->load_action = WMTLoadActionClear;
           }
@@ -1319,7 +1414,8 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
           render->fence_update.merge(clear->fence_update);
           render->fence_wait.merge(clear->fence_wait);
           render->fence_wait.subtract(clear->fence_update);
-          currentFrameStatistics().clear_pass_optimized++;
+          if (!clear->discard)
+            currentFrameStatistics().clear_pass_optimized++;
           clear->~ClearEncoderData();
           clear->next = nullptr;
           clear->type = EncoderType::Null;
@@ -1327,14 +1423,18 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
         }
       } else {
         if (auto attachment = isClearColorSignatureMatched(clear, render)) {
-          if (attachment->load_action == WMTLoadActionLoad) {
+          if (clear->discard) {
+            if (attachment->load_action == WMTLoadActionLoad)
+              attachment->load_action = WMTLoadActionDontCare;
+          } else if (attachment->load_action == WMTLoadActionLoad) {
             attachment->load_action = WMTLoadActionClear;
             attachment->clear_color = clear->color;
           }
           render->fence_update.merge(clear->fence_update);
           render->fence_wait.merge(clear->fence_wait);
           render->fence_wait.subtract(clear->fence_update);
-          currentFrameStatistics().clear_pass_optimized++;
+          if (!clear->discard)
+            currentFrameStatistics().clear_pass_optimized++;
           clear->~ClearEncoderData();
           clear->next = nullptr;
           clear->type = EncoderType::Null;
@@ -1349,10 +1449,7 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
 
       // DontCare can be used because it's going to be cleared anyway
       // just keep in mind DontCare != DontStore
-      if (clear->clear_dsv & 1 && render->depth.attachment == clear->attachment)
-        render->depth.store_action = WMTStoreActionDontCare;
-      if (clear->clear_dsv & 2 && render->stencil.attachment == clear->attachment)
-        render->stencil.store_action = WMTStoreActionDontCare;
+      applyClearStoreHint(render, clear);
     }
     if (former->type == EncoderType::Render && latter->type == EncoderType::Resolve) {
       auto render = reinterpret_cast<RenderEncoderData *>(former);
@@ -1530,11 +1627,42 @@ ArgumentEncodingContext::isEncoderSignatureMatched(RenderEncoderData *r0, Render
   return true;
 }
 
+void
+ArgumentEncodingContext::applyClearStoreHint(RenderEncoderData *render, ClearEncoderData *clear) {
+  if (clear->clear_dsv & 1 && isClearAttachmentMatched(clear, render->depth.attachment))
+    render->depth.store_action = WMTStoreActionDontCare;
+  if (clear->clear_dsv & 2 && isClearAttachmentMatched(clear, render->stencil.attachment))
+    render->stencil.store_action = WMTStoreActionDontCare;
+  /* neutron: same for color: nothing reads the contents before the clear or discard overwrites them.
+     An MSAA attachment that is resolved keeps the resolve but skips storing the samples. */
+  if (!clear->clear_dsv) {
+    for (unsigned i = 0; i < render->render_target_count; i++) {
+      auto &color = render->colors[i];
+      if (!isClearAttachmentMatched(clear, color.attachment))
+        continue;
+      if (color.store_action == WMTStoreActionStore)
+        color.store_action = WMTStoreActionDontCare;
+      else if (color.store_action == WMTStoreActionStoreAndMultisampleResolve)
+        color.store_action = WMTStoreActionMultisampleResolve;
+    }
+  }
+}
+
+/* neutron: a whole-resource discard matches every view of the allocation */
+bool
+ArgumentEncodingContext::isClearAttachmentMatched(ClearEncoderData *clear, const TextureViewRef &attachment) {
+  if (!attachment)
+    return false;
+  if (clear->whole)
+    return attachment->allocation == clear->attachment->allocation;
+  return attachment == clear->attachment;
+}
+
 RenderEncoderColorAttachmentData *
 ArgumentEncodingContext::isClearColorSignatureMatched(ClearEncoderData *clear, RenderEncoderData *render) {
   for (unsigned i = 0; i < render->render_target_count; i++) {
     auto &attachment = render->colors[i];
-    if (attachment.attachment == clear->attachment) {
+    if (isClearAttachmentMatched(clear, attachment.attachment)) {
       return &attachment;
     }
   }
@@ -1545,7 +1673,7 @@ RenderEncoderDepthAttachmentData *
 ArgumentEncodingContext::isClearDepthSignatureMatched(ClearEncoderData *clear, RenderEncoderData *render) {
   if ((clear->clear_dsv & 1) == 0)
     return nullptr;
-  if (render->depth.attachment != clear->attachment)
+  if (!isClearAttachmentMatched(clear, render->depth.attachment))
     return nullptr;
   return &render->depth;
 }
@@ -1554,7 +1682,7 @@ RenderEncoderStencilAttachmentData *
 ArgumentEncodingContext::isClearStencilSignatureMatched(ClearEncoderData *clear, RenderEncoderData *render) {
   if ((clear->clear_dsv & 2) == 0)
     return nullptr;
-  if (render->stencil.attachment != clear->attachment)
+  if (!isClearAttachmentMatched(clear, render->stencil.attachment))
     return nullptr;
   return &render->stencil;
 }
