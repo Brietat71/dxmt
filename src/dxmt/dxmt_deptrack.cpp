@@ -120,7 +120,9 @@ GenericAccessTracker::accessExclusivePreRaster(
     return;
   }
   shared_.enumerate(id, [&](EncoderId id) { wait_fences.set(id); });
-  if (last_exclusive)
+  // like the other accessors: a fence set can only name the last kParityLane encoders (ids are taken modulo that),
+  // and anything older than kLane is already implied by the weak fences
+  if (id - last_exclusive < kLane)
     wait_fences.set(last_exclusive);
 
   if (shared_.isLastAccess(id + 1) || shared_.isLastAccess(id)) {
@@ -218,7 +220,9 @@ GenericAccessTracker::accessExclusiveFragment(
     return;
   }
   shared_.enumerate(id, [&](EncoderId id) { wait_fences.set(id); });
-  if (last_exclusive)
+  // like the other accessors: a fence set can only name the last kParityLane encoders (ids are taken modulo that),
+  // and anything older than kLane is already implied by the weak fences
+  if (id - last_exclusive < kLane)
     wait_fences.set(last_exclusive);
   if (shared_.isLastAccess(id) || shared_.isLastAccess(id - 1)) {
     if (isSharedPreRaster) {
