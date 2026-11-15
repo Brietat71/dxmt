@@ -216,6 +216,11 @@ intégré automatiquement dans le runtime `gs`). Refaire la **trace Metal en vue
 `GS 0c1d 2048x2048x4 c/ dC/S` (passes d'ombre par GS), `R 4c1d 3456x2234x1 cLLLL/SSSS dL/S` (passe principale ; `L` = attachements rechargés).
 C'est ce qui dira si les 8 ms de Vertex et les 16 ms de Fragment viennent des ombres, de la passe principale ou du post-traitement.
 
+**Priorité 2 (GPU hang, aucune construction spéciale non plus)** : lancer le runtime `gs` avec **`DXMT_DEBUG_ENCODER_STATUS=1`** dans l'environnement.
+Les deux `Caused GPU Hang Error` reviennent à chaque lancement (première frame du menu, frames 360-380 ; première frame de la carte, frames 1040-1180).
+Avec la variable, le journal reçoit sous l'erreur l'état de chaque encodeur du tampon (`dxmt:   FAULTED   GS 0c1d 2048x2048x4 …`) :
+il suffit de recopier ces lignes. Contre-épreuve utile : le même chargement en Élevé avec le runtime `fork` (ancien chemin GS) donne-t-il aussi les deux erreurs ?
+
 Le reste (sonde complète, moins urgent) :
 
 Runtime à construire depuis **`origin/gs-probe2`** (= `perf-gs` + 2 commits d'instrumentation, à ne pas fusionner).
