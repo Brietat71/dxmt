@@ -19,11 +19,25 @@
 #include "Metal.hpp"
 #include "dxmt_resource_initializer.hpp"
 #include "dxmt_format.hpp"
+#include "log/log.hpp"
 #include "util_math.hpp"
 #include <cstdint>
 #include <mutex>
 
 namespace dxmt {
+
+// Each init request is encoded inside RETRY_BEGIN/RETRY_END. The ALLOC_*/RETAIN macros flush and `continue` on
+// allocation failure: with the former `do { } while (0)` that `continue` exited the loop and silently dropped the
+// initialization (e.g. textures left with recycled memory when the 1MB command heap filled up during level load).
+#define RETRY_BEGIN                                                                                                    \
+  for (unsigned attempt_ = 0;; attempt_++) {                                                                           \
+    if (attempt_ == 3) {                                                                                               \
+      ERR("ResourceInitializer: dropped a resource initialization after repeated allocation failures");                \
+      break;                                                                                                           \
+    }
+#define RETRY_END                                                                                                      \
+  break;                                                                                                               \
+  }
 
 #define ALLOC_BLIT(type, cmd)                                                                                          \
   type *cmd = nullptr;                                                                                                 \
@@ -81,7 +95,7 @@ uint64_t
 ResourceInitializer::initWithZero(BufferAllocation *buffer, uint64_t offset, uint64_t length) {
   std::lock_guard<dxmt::mutex> lock(mutex_);
 
-  do {
+  RETRY_BEGIN
     RETAIN(buffer);
     ALLOC_BLIT(wmtcmd_blit_fillbuffer, fill);
     fill->type = WMTBlitCommandFillBuffer;
@@ -90,7 +104,7 @@ ResourceInitializer::initWithZero(BufferAllocation *buffer, uint64_t offset, uin
     fill->length = length;
     fill->value = 0;
 
-  } while (0);
+  RETRY_END
 
   return current_seq_id_;
 }
@@ -103,7 +117,7 @@ ResourceInitializer::initDepthStencilWithZero(
   auto height_sub = std::max(1u, texture->height() >> level);
 
   std::lock_guard<dxmt::mutex> lock(mutex_);
-  do {
+  RETRY_BEGIN
     RETAIN(allocation);
     ALLOC_CLEAR(info);
 
@@ -127,7 +141,7 @@ ResourceInitializer::initDepthStencilWithZero(
       info->stencil.level = level;
     }
 
-  } while (0);
+  RETRY_END
 
   return current_seq_id_;
 }
@@ -140,7 +154,7 @@ ResourceInitializer::initRenderTargetWithZero(
   auto height_sub = std::max(1u, texture->height() >> level);
 
   std::lock_guard<dxmt::mutex> lock(mutex_);
-  do {
+  RETRY_BEGIN
     RETAIN(allocation);
     ALLOC_CLEAR(info);
 
@@ -154,7 +168,7 @@ ResourceInitializer::initRenderTargetWithZero(
     info->colors[0].slice = slice;
     info->colors[0].level = level;
 
-  } while (0);
+  RETRY_END
 
   return current_seq_id_;
 }
@@ -205,7 +219,7 @@ ResourceInitializer::initWithZero(
 
   std::lock_guard<dxmt::mutex> lock(mutex_);
 
-  do {
+  RETRY_BEGIN
     ALLOC_ZERO(zero, total_bytes_needed);
     RETAIN(allocation);
     ALLOC_BLIT(wmtcmd_blit_copy_from_buffer_to_texture, copy);
@@ -221,7 +235,7 @@ ResourceInitializer::initWithZero(
     copy->level = level;
     copy->origin = {0, 0, 0};
 
-  } while (0);
+  RETRY_END
 
   return current_seq_id_;
 }
@@ -274,7 +288,7 @@ ResourceInitializer::initWithData(
   size_t total_bytes_needed = bytes_per_image_needed * depth_sub;
 
   std::lock_guard<dxmt::mutex> lock(mutex_);
-  do {
+  RETRY_BEGIN
     RETAIN(allocation);
     ALLOC_BLIT(wmtcmd_blit_copy_from_buffer_to_texture, copy);
     ALLOC_GPU(temp, total_bytes_needed);
@@ -306,7 +320,7 @@ ResourceInitializer::initWithData(
     copy->level = level;
     copy->origin = {0, 0, 0};
 
-  } while (0);
+  RETRY_END
 
   return current_seq_id_;
 }
@@ -326,7 +340,7 @@ ResourceInitializer::initDepthStencilWithData(
   size_t stencil_bytes_per_image = stencil_bytes_per_row * height_sub;
 
   std::lock_guard<dxmt::mutex> lock(mutex_);
-  do {
+  RETRY_BEGIN
     RETAIN(allocation);
     ALLOC_BLIT(wmtcmd_blit_copy_from_buffer_to_texture_withblitoption, depth_copy);
     ALLOC_BLIT(wmtcmd_blit_copy_from_buffer_to_texture_withblitoption, stencil_copy);
@@ -376,7 +390,7 @@ ResourceInitializer::initDepthStencilWithData(
     stencil_copy->origin = {0, 0, 0};
     stencil_copy->options = WMTBlitOptionStencilFromDepthStencil;
 
-  } while (0);
+  RETRY_END
 
   return current_seq_id_;
 }
