@@ -96,6 +96,7 @@ CommandQueue::CommitCurrentChunk() {
   auto &chunk = chunks[chunk_id % kCommandChunkCount];
   chunk.chunk_id = chunk_id;
   chunk.chunk_event_id = GetNextEventSeqId();
+  committed_event_seq_id = chunk.chunk_event_id; /* neutron */
   chunk.frame_ = frame_count;
   chunk.resource_initializer_event_id = initializer.flushToWait();
   auto& statistics = CurrentFrameStatistics();

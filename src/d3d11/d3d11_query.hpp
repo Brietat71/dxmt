@@ -120,6 +120,8 @@ constexpr size_t kEventStallThreshold = 64;
 struct MTLD3D11EventQuery : public ID3D11Query1 {
   virtual void Issue(uint64_t current_seq_id) = 0;
   virtual EventState CheckEventState(uint64_t coherent_seq_id) = 0;
+  /* neutron: the event id that signals this query */
+  virtual uint64_t SignalSeqId() = 0;
 };
 
 template <typename DataType>
@@ -134,6 +136,10 @@ public:
     state = QueryState::Issued;
     should_be_signaled_at = current_seq_id;
     stall_counter = 0;
+  }
+
+  uint64_t SignalSeqId() override {
+    return should_be_signaled_at;
   }
 
   EventState CheckEventState(uint64_t coherent_seq_id) override {

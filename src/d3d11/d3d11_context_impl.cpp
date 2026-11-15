@@ -4329,6 +4329,9 @@ public:
 #pragma region CommandEncoder Maintain State
 
   bool promote_flush = false;
+  /* neutron: clears whose render pass has not started yet (approximate), see InvalidateCurrentPass */
+  uint32_t pending_clears_ = 0;
+  uint32_t promote_deferrals_ = 0;
 
   /**
   Render pass can be invalidated by reasons:
@@ -4376,7 +4379,16 @@ public:
     }
 
     cmdbuf_state = CommandBufferState::Idle;
+    /* neutron: a pending promote_flush (after a query End) waits while clears are recorded whose render pass has
+       not started yet: committing now would put them into another command buffer than their pass, and they could
+       not become its load action (a separate clear pass, plus Load in the pass). At most 8 pass boundaries. */
+    if (promote_flush && !defer_commit && pending_clears_ && promote_deferrals_ < 8) {
+      promote_deferrals_++;
+      return false;
+    }
     if (promote_flush && !defer_commit) {
+      pending_clears_ = 0;
+      promote_deferrals_ = 0;
       Commit();
       return true;
     }
@@ -4418,6 +4430,7 @@ public:
   void
   ClearRenderTargetView(D3D11RenderTargetView *pRenderTargetView, const FLOAT ColorRGBA[4]) {
     InvalidateCurrentPass();
+    pending_clears_++;
     auto clear_color = WMTClearColor{ColorRGBA[0], ColorRGBA[1], ColorRGBA[2], ColorRGBA[3]};
     auto &props = pRenderTargetView->description();
 
@@ -4432,6 +4445,7 @@ public:
     if (ClearFlags == 0)
       return;
     InvalidateCurrentPass();
+    pending_clears_++;
     auto &props = pDepthStencilView->description();
 
     EmitOP([texture = pDepthStencilView->texture(), view = pDepthStencilView->viewId(),
@@ -4458,6 +4472,13 @@ public:
     if (cmdbuf_state == CommandBufferState::RenderEncoderActive)
       return true;
     InvalidateCurrentPass();
+    {
+      /* neutron: the attachments of this pass take up the clears recorded for them (approximate count) */
+      uint32_t attachments = state_.OutputMerger.DSV ? 1 : 0;
+      for (unsigned i = 0; i < state_.OutputMerger.NumRTVs; i++)
+        attachments += state_.OutputMerger.RTVs[i] ? 1 : 0;
+      pending_clears_ -= std::min(pending_clears_, attachments);
+    }
 
     // set dirty state
     state_.ShaderStages[PipelineStage::Vertex].ConstantBuffers.set_dirty();

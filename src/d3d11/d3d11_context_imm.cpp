@@ -421,17 +421,23 @@ public:
       return E_INVALIDARG;
 
     HRESULT hr = S_FALSE;
+    /* neutron: a pending query whose event is already in a committed command buffer does not need a flush.
+       Flushing anyway cuts the frame being recorded into two command buffers, so a clear before the poll can no
+       longer become the load action of the pass after it, and passes on both sides can't be merged. */
+    bool submitted = false;
 
     D3D11_QUERY_DESC desc;
     ((ID3D11Query *)pAsync)->GetDesc(&desc);
     switch (desc.Query) {
     case D3D11_QUERY_EVENT:
     case D3D11_QUERY_TIMESTAMP_DISJOINT: {
+      submitted = static_cast<MTLD3D11EventQuery *>(pAsync)->SignalSeqId() <= cmd_queue.CommittedEventSeqId();
       switch (static_cast<MTLD3D11EventQuery *>(pAsync)->CheckEventState(cmd_queue.SignaledEventSeqId())) {
       case EventState::Pending:
         break;
       case EventState::Stall:
-        GetDataFlags &= ~D3D11_ASYNC_GETDATA_DONOTFLUSH;
+        if (!submitted)
+          GetDataFlags &= ~D3D11_ASYNC_GETDATA_DONOTFLUSH;
         break;
       case EventState::Signaled:
         hr = S_OK;
@@ -486,7 +492,8 @@ public:
     }
     if (hr == S_FALSE && (GetDataFlags & D3D11_ASYNC_GETDATA_DONOTFLUSH) == 0) {
       cmd_queue.CurrentFrameStatistics().event_stall++;
-      Flush();
+      if (!submitted)
+        Flush();
     }
     return hr;
   }
@@ -603,6 +610,8 @@ public:
   void
   Commit() override {
     promote_flush = false;
+    pending_clears_ = 0; /* neutron: see InvalidateCurrentPass */
+    promote_deferrals_ = 0;
     D3D11_ASSERT(cmdbuf_state == CommandBufferState::Idle);
     ctx_state.cmd_queue.CommitCurrentChunk();
     ctx_state.has_dirty_op_since_last_event = false;

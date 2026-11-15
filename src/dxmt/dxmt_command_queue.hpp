@@ -198,6 +198,8 @@ public:
   ArgumentEncodingContext argument_encoding_ctx;
   WMT::Reference<WMT::SharedEvent> event;
   std::uint64_t current_event_seq_id = 0;
+  /* neutron: event id signaled by the last committed chunk, see CommittedEventSeqId() */
+  std::uint64_t committed_event_seq_id = 0;
   FrameStatisticsContainer statistics;
   ResourceInitializer initializer;
   CounterPool counter_pool;
@@ -230,6 +232,12 @@ public:
   uint64_t
   GetCurrentEventSeqId() {
     return current_event_seq_id;
+  };
+
+  /* neutron: an event at or below this id is in a committed command buffer, flushing does not bring it closer */
+  uint64_t
+  CommittedEventSeqId() {
+    return committed_event_seq_id;
   };
 
 
